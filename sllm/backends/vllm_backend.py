@@ -36,7 +36,11 @@ from vllm import (
     SamplingParams,
 )
 from vllm.inputs import TokensPrompt
-from vllm.utils import Counter
+
+try:
+    from vllm.utils.counter import Counter
+except ImportError:
+    from vllm.utils import Counter
 
 from sllm.backends.backend_utils import (
     BackendStatus,
@@ -188,7 +192,6 @@ class VllmBackend(SllmBackend):
         filtered_engine_config["enable_prefix_caching"] = (
             self.enable_prefix_caching
         )
-        filtered_engine_config["task"] = self.task
 
         logger.info(
             f"Creating new VLLM engine with config: {filtered_engine_config}"

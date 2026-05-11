@@ -14,7 +14,7 @@ include(FetchContent)
 FetchContent_Declare(
   glog
   GIT_REPOSITORY https://github.com/google/glog.git
-  GIT_TAG        v0.6.0
+  GIT_TAG        v0.7.1
 )
 FetchContent_Declare(
     googletest
@@ -32,7 +32,7 @@ find_package(HIP QUIET)
 # set CUDA or HIP
 if (CUDAToolkit_FOUND)
   message(STATUS "CUDA found")
-  set(CUDA_SUPPORTED_ARCHS "7.0;7.5;8.0;8.6;8.9;9.0")
+  set(CUDA_SUPPORTED_ARCHS "7.0;7.5;8.0;8.6;8.9;9.0;10.0;12.0")
   set(SLLM_STORE_GPU_LANG "CUDA")
   enable_language(CUDA)
 elseif (HIP_FOUND)
