@@ -32,6 +32,8 @@ class AlignedBuffer {
   size_t writePadding(size_t padding_size);
 
  private:
+  bool flushBuffer(size_t size);
+
   int fd_;
   size_t buf_size_;
   size_t buf_pos_;

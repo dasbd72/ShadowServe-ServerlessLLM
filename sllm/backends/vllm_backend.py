@@ -242,6 +242,12 @@ class VllmBackend(SllmBackend):
             "request_id", f"chatcmpl-{uuid.uuid4()}"
         )
 
+        # OpenAI chat/completions uses max_completion_tokens; vLLM uses max_tokens.
+        if "max_completion_tokens" in request_data:
+            mct = request_data.pop("max_completion_tokens")
+            if mct is not None and "max_tokens" not in request_data:
+                request_data["max_tokens"] = mct
+
         try:
             sampling_params = SamplingParams(**request_data)
         except Exception as e:

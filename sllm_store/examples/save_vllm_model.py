@@ -119,6 +119,13 @@ parser.add_argument(
     default=1,
     help="Tensor parallel size.",
 )
+parser.add_argument(
+    "--torch-dtype",
+    type=str,
+    choices=["float16", "bfloat16", "float32"],
+    default="float16",
+    help="Torch dtype to use when materializing the model.",
+)
 
 args = parser.parse_args()
 
@@ -126,11 +133,12 @@ model_name = args.model_name
 local_model_path = args.local_model_path
 storage_path = args.storage_path
 tensor_parallel_size = args.tensor_parallel_size
+torch_dtype = args.torch_dtype
 
 downloader = VllmModelDownloader()
 downloader.download_vllm_model(
     model_name,
-    "float16",
+    torch_dtype,
     tensor_parallel_size=tensor_parallel_size,
     storage_path=storage_path,
     local_model_path=local_model_path,

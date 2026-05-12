@@ -93,7 +93,7 @@ pip install serverless-llm-store
 ### 1. Convert a Model
 
 ```bash
-sllm-store save --model Qwen/Qwen3-0.6B --backend transformers
+sllm-store save --model Qwen/Qwen3-0.6B --backend transformers --torch-dtype bfloat16
 ```
 
 ### 2. Start Store Server
@@ -113,13 +113,14 @@ sllm-store start \
 ### 3. Load Model 6-10x Faster
 
 ```python
+import torch
 from sllm_store.transformers import load_model
 
 # Load model (6-10x faster than from_pretrained!)
 model = load_model(
     "Qwen/Qwen3-0.6B",
     device_map="auto",
-    torch_dtype="float16"
+    torch_dtype=torch.bfloat16
 )
 
 # Use as normal PyTorch/Transformers model

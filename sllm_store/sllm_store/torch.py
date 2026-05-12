@@ -15,6 +15,7 @@
 #  See the License for the specific language governing permissions and         #
 #  limitations under the License.                                              #
 # ---------------------------------------------------------------------------- #
+import collections
 import json
 import os
 import time
@@ -50,12 +51,17 @@ def save_dict(
     state_dict: Dict[str, torch.Tensor], model_path: Union[str, os.PathLike]
 ):
     tensor_names = list(state_dict.keys())
+    # Per-tensor data pointer + nbytes so views into shared storage are not
+    # confused with the whole allocation (see SaveTensors dedupe by slice).
+    contiguous_params: Dict[str, torch.Tensor] = {}
     tensor_data_index = {}
     for name, param in state_dict.items():
-        param_storage = param.untyped_storage()
-        data_ptr = param_storage.data_ptr()
-        size = param_storage.size()
-        tensor_data_index[name] = (data_ptr, size)
+        p = param if param.is_contiguous() else param.contiguous()
+        contiguous_params[name] = p
+        # Use numel * element_size (PyTorch exposes `nbytes` as a property on
+        # recent versions; calling nbytes() raises TypeError).
+        nbytes = p.element_size() * p.numel()
+        tensor_data_index[name] = (p.data_ptr(), nbytes)
 
     if not os.path.exists(model_path):
         os.makedirs(model_path, exist_ok=True)
@@ -65,7 +71,8 @@ def save_dict(
 
     # create tensor index
     tensor_index = {}
-    for name, param in state_dict.items():
+    for name in tensor_names:
+        param = contiguous_params[name]
         # name: offset, size
         tensor_index[name] = (
             tensor_offsets[name],
@@ -157,6 +164,20 @@ def load_dict_non_blocking(
     state_dict = restore_tensors(
         tensor_meta_index, cuda_memory_ptrs, tensor_device_offsets
     )
+    # restore_tensors() may return many tensors that alias one cudaMalloc slab;
+    # only the base view carries a cudaFree deleter. Callers (e.g. vLLM
+    # ServerlessLLMLoader) may replace tensors via .to() — if the base view is
+    # freed first, other views hit illegal memory. Clone tied / aliased views
+    # so each tensor owns storage before any dtype cast or assignment.
+    ptr_to_keys = collections.defaultdict(list)
+    for key, tensor in state_dict.items():
+        if tensor.is_cuda and tensor.numel():
+            ptr_to_keys[tensor.data_ptr()].append(key)
+    for keys in ptr_to_keys.values():
+        if len(keys) > 1:
+            for k in keys:
+                state_dict[k] = state_dict[k].clone()
+
     logger.info(f"restore state_dict takes {time.time() - start} seconds")
 
     return replica_uuid, state_dict

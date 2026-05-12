@@ -109,6 +109,7 @@ def deep_update(original: dict, updates: dict) -> dict:
 
 def deploy_model(
     model,
+    torch_dtype=None,
     config=None,
     backend=None,
     num_gpus=None,
@@ -196,6 +197,10 @@ def deploy_model(
         print("  sllm deploy --config my_config.json --model facebook/opt-1.3b")
         sys.exit(1)
 
+    if torch_dtype:
+        config_data.setdefault("backend_config", {})["torch_dtype"] = (
+            torch_dtype
+        )
     if backend:
         config_data["backend"] = backend
     if num_gpus is not None:

@@ -17,6 +17,7 @@
 //  ----------------------------------------------------------------------------
 #include "tensor_writer.h"
 
+#include <filesystem>
 #include <iostream>
 
 TensorWriter::TensorWriter(const std::string& filename) : filename_(filename) {}
@@ -25,7 +26,13 @@ TensorWriter::~TensorWriter() {}
 
 uint64_t TensorWriter::writeRecord(const char* data, size_t size) {
   if (partition_idx_ == -1 || partition_size_ + size > kPartitionMaxSize) {
-    // create a new partition
+    if (partition_idx_ >= 0) {
+      buffer_.reset();
+      std::string closed_path =
+          filename_ + "_" + std::to_string(partition_idx_);
+      closed_file_sizes_.push_back(
+          static_cast<uint64_t>(std::filesystem::file_size(closed_path)));
+    }
     partition_idx_++;
     partition_size_ = 0;
     std::string partition_filename =
@@ -33,17 +40,22 @@ uint64_t TensorWriter::writeRecord(const char* data, size_t size) {
     buffer_ = std::make_unique<AlignedBuffer>(partition_filename);
   }
 
-  uint64_t start_offset = offset_;
+  // Byte offset in the concatenation of tensor.data_* (what loaders expect),
+  // not a pre-rotation logical stream offset (which broke multi-partition
+  // checkpoints when a tensor was rotated entirely into the next file).
+  uint64_t physical_start = 0;
+  for (uint64_t s : closed_file_sizes_) {
+    physical_start += s;
+  }
+  physical_start += static_cast<uint64_t>(partition_size_);
+
   // make sure the data is 64-bit aligned
   size_t padding = (size % 8) ? (8 - size % 8) : 0;
   size_t written = buffer_->writeData(data, size);
   if (padding) {
     written += buffer_->writePadding(padding);
   }
-  offset_ += written;
   partition_size_ += written;
-  // std::cerr << "writeRecord: " << partition_idx_ << " " << partition_size_ <<
-  // " " << kPartitionMaxSize << std::endl;
 
-  return start_offset;
+  return physical_start;
 }

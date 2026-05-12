@@ -25,7 +25,7 @@
 
 AlignedBuffer::AlignedBuffer(const std::string& filename)
     : fd_(-1), buf_size_(kBufferSize), buf_pos_(0), file_offset_(0) {
-  fd_ = open(filename.c_str(), O_WRONLY | O_CREAT | O_DIRECT, 0644);
+  fd_ = open(filename.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_DIRECT, 0644);
   if (fd_ < 0) {
     std::cerr << "Failed to open file " << filename << std::endl;
   }
@@ -33,9 +33,14 @@ AlignedBuffer::AlignedBuffer(const std::string& filename)
 }
 
 AlignedBuffer::~AlignedBuffer() {
-  // if the buffer is not written to file, write it to file
   if (buffer_ && buf_pos_) {
-    pwrite(fd_, buffer_, buf_pos_, file_offset_);
+    // O_DIRECT requires aligned write sizes. Round up the final logical bytes
+    // with zero padding so the tail of tensor.data_* is actually persisted.
+    size_t flush_size = ((buf_pos_ + kAlignment - 1) / kAlignment) * kAlignment;
+    if (flush_size > buf_pos_) {
+      memset(static_cast<char*>(buffer_) + buf_pos_, 0, flush_size - buf_pos_);
+    }
+    flushBuffer(flush_size);
   }
   if (buffer_) {
     free(buffer_);
@@ -43,6 +48,18 @@ AlignedBuffer::~AlignedBuffer() {
   if (fd_ >= 0) {
     close(fd_);
   }
+}
+
+bool AlignedBuffer::flushBuffer(size_t size) {
+  ssize_t ret = pwrite(fd_, buffer_, size, file_offset_);
+  if (ret < 0 || static_cast<size_t>(ret) != size) {
+    std::cerr << "Failed to write to file, ret: " << ret << " errno: " << errno
+              << std::endl;
+    return false;
+  }
+  file_offset_ += size;
+  buf_pos_ = 0;
+  return true;
 }
 
 size_t AlignedBuffer::writeData(const void* data, size_t size) {
@@ -66,9 +83,10 @@ size_t AlignedBuffer::writeData(const void* data, size_t size) {
       memcpy(direct_write_buf, (char*)data + written, direct_write_size);
       ssize_t ret =
           pwrite(fd_, direct_write_buf, direct_write_size, file_offset_);
-      if (ret < 0 || ret != direct_write_size) {
+      if (ret < 0 || static_cast<size_t>(ret) != direct_write_size) {
         std::cerr << "Failed to write to file, ret: " << ret
                   << " errno: " << errno << std::endl;
+        free(direct_write_buf);
         return written;
       }
       written += direct_write_size;
@@ -81,14 +99,9 @@ size_t AlignedBuffer::writeData(const void* data, size_t size) {
     buf_pos_ += to_write;
     written += to_write;
     if (buf_pos_ == buf_size_) {
-      ssize_t ret = pwrite(fd_, buffer_, buf_size_, file_offset_);
-      if (ret < 0 || ret != buf_size_) {
-        std::cerr << "Failed to write to file, ret: " << ret
-                  << " errno: " << errno << std::endl;
+      if (!flushBuffer(buf_size_)) {
         return written;
       }
-      buf_pos_ = 0;
-      file_offset_ += buf_size_;
     }
   }
   return written;
@@ -99,15 +112,14 @@ size_t AlignedBuffer::writePadding(size_t padding_size) {
     std::cerr << "Padding size should be less than 8 bytes" << std::endl;
     return 0;
   }
-  buf_pos_ += padding_size;
-  if (buf_pos_ > buf_size_) {
+  if (buf_pos_ + padding_size > buf_size_) {
     std::cerr << "Padding size is too large" << std::endl;
     return 0;
   }
+  memset(static_cast<char*>(buffer_) + buf_pos_, 0, padding_size);
+  buf_pos_ += padding_size;
   if (buf_pos_ == buf_size_) {
-    pwrite(fd_, buffer_, buf_pos_, file_offset_);
-    buf_pos_ = 0;
-    file_offset_ += buf_size_;
+    flushBuffer(buf_size_);
   }
   return padding_size;
 }

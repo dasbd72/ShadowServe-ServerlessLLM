@@ -55,6 +55,15 @@ def resolve_storage_path(cli_path: Optional[str]) -> str:
     return os.path.expanduser("~/models/")
 
 
+def parse_torch_dtype(torch_dtype: str) -> torch.dtype:
+    dtype_map = {
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "float32": torch.float32,
+    }
+    return dtype_map[torch_dtype]
+
+
 class VllmModelDownloader:
     def __init__(self):
         pass
@@ -248,6 +257,13 @@ def start(
     default=None,
     help="Local path to save the model (default: $STORAGE_PATH or ~/models/)",  # noqa: E501
 )
+@click.option(
+    "--torch-dtype",
+    type=click.Choice(["float16", "bfloat16", "float32"]),
+    default="float16",
+    show_default=True,
+    help="Torch dtype to use when materializing the model.",
+)
 def save(
     model_name,
     backend,
@@ -255,6 +271,7 @@ def save(
     tensor_parallel_size,
     local_model_path,
     storage_path,
+    torch_dtype,
 ):
     """
     Saves a model to the sllm-store's storage.
@@ -275,18 +292,19 @@ def save(
             storage_path = os.path.join(storage_path, "vllm")
             downloader.download_vllm_model(
                 model_name,
-                "float16",
+                torch_dtype,
                 tensor_parallel_size=tensor_parallel_size,
                 storage_path=storage_path,
                 local_model_path=local_model_path,
             )
         elif backend == "transformers":
+            parsed_torch_dtype = parse_torch_dtype(torch_dtype)
             if adapter_name:
                 config = AutoConfig.from_pretrained(
                     model_name,
                     trust_remote_code=True,
                 )
-                config.torch_dtype = torch.float16
+                config.torch_dtype = parsed_torch_dtype
                 module = importlib.import_module("transformers")
                 hf_model_cls = module.AutoModelForCausalLM
                 base_model = hf_model_cls.from_config(
@@ -303,7 +321,7 @@ def save(
             else:
                 # Load a model from HuggingFace model hub
                 model = AutoModelForCausalLM.from_pretrained(
-                    model_name, torch_dtype=torch.float16
+                    model_name, torch_dtype=parsed_torch_dtype
                 )
 
                 # Save the model to the local path
@@ -343,12 +361,20 @@ def save(
     default=None,
     help="Local path where model is saved (default: $STORAGE_PATH or ~/models/)",  # noqa: E501
 )
+@click.option(
+    "--torch-dtype",
+    type=click.Choice(["float16", "bfloat16", "float32"]),
+    default="float16",
+    show_default=True,
+    help="Torch dtype to use when loading the model.",
+)
 def load(
     model_name,
     backend,
     adapter_name,
     precision,
     storage_path,
+    torch_dtype,
 ):
     """
     Loads a model from the sllm-store's storage.
@@ -376,6 +402,7 @@ def load(
 
     try:
         start_load_time = time.time()
+        parsed_torch_dtype = parse_torch_dtype(torch_dtype)
 
         if backend == "vllm":
             from vllm import LLM
@@ -384,7 +411,7 @@ def load(
             llm = LLM(
                 model=model_full_path,
                 load_format="serverless_llm",
-                dtype="float16",
+                dtype=torch_dtype,
             )
             logger.info(
                 f"Model loading time: {time.time() - start_load_time:.2f}s"
@@ -402,7 +429,7 @@ def load(
                 model = load_model(
                     model_name,
                     device_map="auto",
-                    torch_dtype=torch.float16,
+                    torch_dtype=parsed_torch_dtype,
                     storage_path=storage_path,
                     fully_parallel=True,
                 )
@@ -413,13 +440,13 @@ def load(
                     adapter_path=adapter_name,
                     device_map="auto",
                     storage_path=storage_path,
-                    torch_dtype=torch.float16,
+                    torch_dtype=parsed_torch_dtype,
                 )
             else:
                 model = load_model(
                     model_name,
                     device_map="auto",
-                    torch_dtype=torch.float16,
+                    torch_dtype=parsed_torch_dtype,
                     storage_path=storage_path,
                     fully_parallel=True,
                     quantization_config=quantization_config,

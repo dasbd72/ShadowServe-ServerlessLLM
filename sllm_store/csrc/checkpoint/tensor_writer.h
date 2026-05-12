@@ -17,6 +17,7 @@
 //  ----------------------------------------------------------------------------
 #pragma once
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
@@ -34,9 +35,10 @@ class TensorWriter final {
   uint64_t writeRecord(const char* data, size_t size);
 
  private:
-  size_t offset_ = 0;
   int partition_idx_ = -1;
   size_t partition_size_ = 0;
   std::string filename_;
   std::unique_ptr<AlignedBuffer> buffer_;
+  // Byte sizes of completed partition files (tensor.data_0, ...), in order.
+  std::vector<uint64_t> closed_file_sizes_;
 };

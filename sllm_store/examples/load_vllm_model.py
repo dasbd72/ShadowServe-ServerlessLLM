@@ -18,14 +18,22 @@ parser.add_argument(
     default=os.path.expanduser("~/models"),
     help="Local path to save the model.",
 )
+parser.add_argument(
+    "--torch-dtype",
+    type=str,
+    choices=["float16", "bfloat16", "float32"],
+    default="float16",
+    help="Torch dtype to use when loading the model.",
+)
 
 args = parser.parse_args()
 
 model_name = args.model_name
 storage_path = args.storage_path
+torch_dtype = args.torch_dtype
 model_path = os.path.join(storage_path, model_name)
 
-llm = LLM(model=model_path, load_format="serverless_llm", dtype="float16")
+llm = LLM(model=model_path, load_format="serverless_llm", dtype=torch_dtype)
 
 prompts = [
     "Hello, my name is",

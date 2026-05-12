@@ -36,6 +36,10 @@ def cli():
     "--model",
     help="Model name from HuggingFace model hub (required if not specified in config file)",
 )
+@click.option(
+    "--torch-dtype",
+    help="Model precision for quantization (e.g., float16, bfloat16)",
+)
 @click.option("--config", help="Path to configuration file")
 @click.option("--backend", help="Backend framework (e.g., vllm, transformers)")
 @click.option(
@@ -67,6 +71,7 @@ def cli():
 )
 def deploy(
     model,
+    torch_dtype,
     config,
     backend,
     num_gpus,
@@ -106,6 +111,7 @@ def deploy(
 
     deploy_model(
         model=model,
+        torch_dtype=torch_dtype,
         config=config,
         backend=backend,
         num_gpus=num_gpus,
