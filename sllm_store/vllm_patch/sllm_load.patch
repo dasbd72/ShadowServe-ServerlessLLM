@@ -28,10 +28,10 @@ index ff95d5b94..b6ab1cf9a 100644
  
 diff --git a/vllm/model_executor/model_loader/sllm_loader.py b/vllm/model_executor/model_loader/sllm_loader.py
 new file mode 100644
-index 000000000..822f6683f
+index 000000000..4ad6faf62
 --- /dev/null
 +++ b/vllm/model_executor/model_loader/sllm_loader.py
-@@ -0,0 +1,275 @@
+@@ -0,0 +1,280 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +import collections
@@ -298,6 +298,11 @@ index 000000000..822f6683f
 +
 +        rank = get_tensor_model_parallel_rank()
 +        state_dict = ServerlessLLMLoader._filter_subtensors(model.state_dict())
++        state_dict = {
++            k: v
++            for k, v in state_dict.items()
++            if not ServerlessLLMLoader._is_optional_buffer(k)
++        }
 +
 +        # move all tensors to CPU
 +        for key, tensor in state_dict.items():
@@ -307,11 +312,88 @@ index 000000000..822f6683f
 +        if not os.path.exists(save_path):
 +            os.makedirs(save_path)
 +        save_dict(state_dict, save_path)
+diff --git a/vllm/shadow/models/loader.py b/vllm/shadow/models/loader.py
+index 9a663ced5..9ddf46d8a 100644
+--- a/vllm/shadow/models/loader.py
++++ b/vllm/shadow/models/loader.py
+@@ -56,6 +56,9 @@ class ShadowModelLoader:
+         """
+         model = self._config.model
+ 
++        if self._config.load_format == "serverless_llm":
++            return os.path.normpath(os.path.expanduser(model))
++
+         if os.path.isdir(model):
+             logger.info("Using local model directory: %s", model)
+             return model
+@@ -131,6 +134,10 @@ class ShadowModelLoader:
+         """
+         load_format = self._config.load_format
+ 
++        if load_format == "serverless_llm":
++            yield from self._iter_sllm()
++            return
++
+         if load_format != "safetensors":
+             raise ValueError(
+                 f"unsupported shadow load_format={load_format!r}; "
+@@ -154,6 +161,51 @@ class ShadowModelLoader:
+             f"No safetensors or .bin/.pt weight files found in {model_dir}"
+         )
+ 
++    def _iter_sllm(self) -> Generator[tuple[str, torch.Tensor], None, None]:
++        from sllm_store.torch import load_dict
++
++        model_id = self._sllm_store_model_id()
++        logger.info(
++            "SLLM load_dict model_id=%r (local dir=%s)", model_id, self.model_dir
++        )
++        state = load_dict(model_id, {"": "cpu"})
++        for name in list(state.keys()):
++            tensor = state.pop(name)
++            self._warn_dtype_mismatch(name, tensor.dtype)
++            yield name, tensor
++            del tensor
++        del state
++
++    @staticmethod
++    def _remove_storage_prefix(path: str, prefix: str) -> str:
++        path = os.path.normpath(path)
++        prefix = os.path.normpath(prefix)
++
++        if path == prefix:
++            return ""
++        if path.startswith(prefix + os.sep):
++            return path[len(prefix) :].lstrip(os.sep)
++        return path
++
++    def _sllm_store_model_id(self) -> str:
++        full = os.path.normpath(os.path.expanduser(self.model_dir))
++        if not os.path.isabs(full):
++            full = os.path.abspath(full)
++        full = os.path.join(full, "rank_0")
++        storage_path = os.getenv("STORAGE_PATH", "~/models")
++        storage_path = os.path.normpath(os.path.expanduser(storage_path))
++        rel = self._remove_storage_prefix(full, storage_path)
++        if not rel:
++            raise ValueError(
++                f"SLLM model directory {full!r} equals STORAGE_PATH {storage_path!r}; "
++                "cannot derive store model id."
++            )
++        if os.path.isabs(rel):
++            raise ValueError(
++                f"SLLM model directory {full!r} should be under {storage_path!r}."
++            )
++        return rel
++
+     def _iter_safetensors(
+         self,
+         shard_files: list[str],
 diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
-index e3b3433d9..9b7f26fd7 100644
+index 43f2eba0b..5b03bbb04 100644
 --- a/vllm/v1/engine/core.py
 +++ b/vllm/v1/engine/core.py
-@@ -1168,6 +1168,16 @@ class EngineCore:
+@@ -1173,6 +1173,16 @@ class EngineCore:
              path=path, pattern=pattern, max_size=max_size
          )
  
@@ -329,7 +411,7 @@ index e3b3433d9..9b7f26fd7 100644
          self,
          method: str | Callable[..., _R],
 diff --git a/vllm/v1/engine/core_client.py b/vllm/v1/engine/core_client.py
-index 7e1f1cf41..21b24b0d8 100644
+index b214f6e2b..fc8be3d77 100644
 --- a/vllm/v1/engine/core_client.py
 +++ b/vllm/v1/engine/core_client.py
 @@ -187,6 +187,14 @@ class EngineCoreClient(ABC):
@@ -342,12 +424,27 @@ index 7e1f1cf41..21b24b0d8 100644
 +        pattern: str | None = None,
 +        max_size: int | None = None,
 +    ) -> None:
++        raise NotImplementedError
++
+     def collective_rpc(
+         self,
+         method: str | Callable[..., _R],
+@@ -390,6 +398,14 @@ class InprocClient(EngineCoreClient):
+     ) -> None:
+         self.engine_core.save_sharded_state(path, pattern, max_size)
+ 
++    def save_serverless_llm_state(
++        self,
++        path: str,
++        pattern: str | None = None,
++        max_size: int | None = None,
++    ) -> None:
 +        self.engine_core.save_serverless_llm_state(path, pattern, max_size)
 +
      def collective_rpc(
          self,
          method: str | Callable[..., _R],
-@@ -894,6 +902,14 @@ class SyncMPClient(MPClient):
+@@ -959,6 +975,14 @@ class SyncMPClient(MPClient):
      ) -> None:
          self.call_utility("save_sharded_state", path, pattern, max_size)
  
@@ -359,10 +456,10 @@ index 7e1f1cf41..21b24b0d8 100644
 +    ) -> None:
 +        self.call_utility("save_serverless_llm_state", path, pattern, max_size)
 +
- 
- class AsyncMPClient(MPClient):
-     """Asyncio-compatible client for multi-proc EngineCore."""
-@@ -1133,6 +1149,16 @@ class AsyncMPClient(MPClient):
+     def shadow_migration_migrate(
+         self,
+         migration_id: int,
+@@ -1221,6 +1245,16 @@ class AsyncMPClient(MPClient):
      ) -> None:
          await self.call_utility_async("save_sharded_state", path, pattern, max_size)
  
@@ -401,13 +498,13 @@ index 8e7c48054..623920f5a 100644
      @abstractmethod
      def check_health(self) -> None:
          """Checks if the executor is healthy. If not, it should raise an
-diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
-index 87222c7bc..8cc9edd97 100644
---- a/vllm/v1/worker/gpu_model_runner.py
-+++ b/vllm/v1/worker/gpu_model_runner.py
-@@ -4545,6 +4545,21 @@ class GPUModelRunner(
-                     weights_not_loaded,
-                 )
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index c3e154023..16294c185 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -1043,6 +1043,21 @@ class Worker(WorkerBase):
+             max_size=max_size,
+         )
  
 +    def save_serverless_llm_state(
 +        self,
@@ -418,30 +515,7 @@ index 87222c7bc..8cc9edd97 100644
 +        from vllm.model_executor.model_loader import ServerlessLLMLoader
 +
 +        ServerlessLLMLoader.save_model(
-+            self.model,
-+            path,
-+            pattern=pattern,
-+            max_size=max_size,
-+        )
-+
-     def _get_prompt_logprobs_dict(
-         self,
-         hidden_states: torch.Tensor,
-diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
-index 76e2e56a0..44d3dec08 100644
---- a/vllm/v1/worker/gpu_worker.py
-+++ b/vllm/v1/worker/gpu_worker.py
-@@ -1043,6 +1043,18 @@ class Worker(WorkerBase):
-             max_size=max_size,
-         )
- 
-+    def save_serverless_llm_state(
-+        self,
-+        path: str,
-+        pattern: str | None = None,
-+        max_size: int | None = None,
-+    ) -> None:
-+        self.model_runner.save_serverless_llm_state(
++            self.model_runner.model,
 +            path,
 +            pattern=pattern,
 +            max_size=max_size,
