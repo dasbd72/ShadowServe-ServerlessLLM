@@ -70,6 +70,20 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("wait_model_in_gpu", &CheckpointStore::WaitModelInGpu,
            py::arg("model_path"), py::arg("replica_uuid"),
            "Wait for a model to be available in GPU memory.")
+      .def(
+          "load_model_into_client_host_shm_async",
+          [](CheckpointStore& cs, const std::string& model_path,
+             const std::string& posix_shm_name, size_t shm_size,
+             const std::vector<MemCopyChunk>& chunks) {
+            return cs.LoadModelIntoClientHostShmAsync(
+                model_path, posix_shm_name, shm_size, chunks);
+          },
+          py::arg("model_path"), py::arg("posix_shm_name"), py::arg("shm_size"),
+          py::arg("chunks"),
+          "Copy staged host weights into a client POSIX shm object (async).")
+      .def("wait_model_client_host_shm",
+           &CheckpointStore::WaitModelClientHostShm, py::arg("model_path"),
+           "Wait until load_model_into_client_host_shm_async finishes.")
       .def("unload_model_from_host", &CheckpointStore::UnloadModelFromHost,
            py::arg("model_path"), "Unload a model from the host memory.")
       .def("clear_mem", &CheckpointStore::ClearMem,

@@ -57,8 +57,11 @@ class Model {
   int ToGpu(const std::string& replica_uuid, const MemPtrListMap& device_ptrs,
             const std::unordered_map<int, MemCopyChunkList>& mem_copy_chunks,
             const std::unordered_map<int, MemCopyHandleList>& mem_copy_handles);
+  int ToCpu(const std::string& posix_shm_name, const size_t shm_size,
+            const MemCopyChunkList& mem_copy_chunk_list, const int num_threads);
   int WaitInHost();
   int WaitInGpu(const std::string& replica_uuid);
+  int WaitInCpu();
   int FreeGpu(const std::string& replica_uuid);
   int FreeHost();
   int TryFreeHost();
@@ -68,6 +71,7 @@ class Model {
   std::mutex mutex_;
   std::condition_variable cv_;
   MemoryState state_ = MemoryState::UNINITIALIZED;
+  MemoryState cpu_state_ = MemoryState::UNINITIALIZED;
 
   // Model path
   const std::string model_path_;

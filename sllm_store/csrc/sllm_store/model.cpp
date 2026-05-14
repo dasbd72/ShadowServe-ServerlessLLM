@@ -17,13 +17,16 @@
 //  ----------------------------------------------------------------------------
 #include "model.h"
 
+#include <errno.h>
 #include <fcntl.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <condition_variable>
+#include <cstring>
 #include <filesystem>
 #include <future>
 #include <mutex>
@@ -318,9 +321,8 @@ int Model::ToGpu(
             }
             if (gpu_replica->state_ == MemoryState::CANCELLED) {
               LOG(INFO) << "Loading from mem for model " << model_path_
-                        << " is cancelled,"
-                        << " chunk " << chunk_id << " offset "
-                        << " size " << size;
+                        << " is cancelled," << " chunk " << chunk_id
+                        << " offset " << " size " << size;
               return 0;
             }
 
@@ -384,17 +386,152 @@ int Model::ToGpu(
   return 0;
 }
 
-int Model::WaitInHost() {
+int Model::ToCpu(const std::string& posix_shm_name, const size_t shm_size,
+                 const MemCopyChunkList& mem_copy_chunk_list,
+                 const int num_threads) {
   std::unique_lock<std::mutex> lock(mutex_);
-  if (state_ < MemoryState::LOADED) {
-    cv_.wait(lock, [this] {
-      return state_ == MemoryState::LOADED ||
-             state_ == MemoryState::INTERRUPTED;
-    });
+  std::shared_ptr<PinnedMemory> pin;
+  if (state_ == MemoryState::UNINITIALIZED) {
+    LOG(ERROR) << "Model " << model_path_ << " is not initialized";
+    return -1;
+  }
+  if (posix_shm_name.empty() || shm_size == 0) {
+    LOG(ERROR) << "Invalid POSIX shm name or size";
+    return -1;
+  }
+  pin = pinned_mem_;
+  cpu_state_ = MemoryState::LOADING;
+  cv_.notify_all();
+  lock.unlock();
+
+  int fd = shm_open(posix_shm_name.c_str(), O_RDWR, 0600);
+  if (fd < 0) {
+    LOG(ERROR) << "shm_open failed for " << posix_shm_name << ": "
+               << strerror(errno);
+    lock.lock();
+    cpu_state_ = MemoryState::INTERRUPTED;
+    cv_.notify_all();
+    lock.unlock();
+    return -1;
   }
 
-  if (state_ >= MemoryState::INTERRUPTED) {
-    LOG(INFO) << "Model " << model_path_ << " is interrupted";
+  void* dst_base =
+      mmap(nullptr, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  if (dst_base == MAP_FAILED) {
+    LOG(ERROR) << "mmap failed for " << posix_shm_name << ": "
+               << strerror(errno);
+    close(fd);
+    lock.lock();
+    cpu_state_ = MemoryState::INTERRUPTED;
+    cv_.notify_all();
+    lock.unlock();
+    return -1;
+  }
+
+  std::shared_ptr<BatchQueue> cpu_copy_queue = std::make_shared<BatchQueue>();
+
+  auto dispatch_future = std::async(
+      std::launch::async,
+      [this, pin, mem_copy_chunk_list, cpu_copy_queue, num_threads]() {
+        const auto& host_buffers = pin->get();
+        const size_t chunk_size = pin->chunk_size();
+        const size_t num_chunks = pin->num_chunks();
+        std::vector<std::vector<GpuChunk>> chunk_id_to_gpu_chunks(num_chunks);
+
+        for (const auto& [src_off, size, dst_off, _] : mem_copy_chunk_list) {
+          std::vector<std::tuple<int, size_t, size_t>> chunks =
+              MapDataToChunks(src_off, size, chunk_size);
+          size_t dst_adv = dst_off;
+          for (const auto& [chunk_id, chunk_offset, psz] : chunks) {
+            chunk_id_to_gpu_chunks[chunk_id].push_back(
+                std::make_tuple(0, chunk_offset, psz, dst_adv, 0));
+            dst_adv += psz;
+          }
+        }
+
+        for (int i = 0; i < host_ptr_vector_->capacity(); i++) {
+          auto data_chunk = host_ptr_vector_->dequeue(i);
+          auto chunk_id = data_chunk.chunk_id_;
+          auto& gpu_chunks = chunk_id_to_gpu_chunks[chunk_id];
+          for (const auto& [device_id, chunk_offset, size, dst_offset,
+                            handle_idx] : gpu_chunks) {
+            cpu_copy_queue->enqueue(
+                GpuBatch{chunk_id, chunk_offset, size, dst_offset, 0});
+          }
+        }
+
+        for (int i = 0; i < num_threads; i++) {
+          cpu_copy_queue->enqueue(GpuBatch{});
+        }
+        return 0;
+      });
+
+  std::vector<std::future<int>> futures;
+  for (int thread_idx = 0; thread_idx < num_threads; thread_idx++) {
+    futures.emplace_back(std::async(
+        std::launch::async,
+        [this, pin, dst_base, cpu_copy_queue, thread_idx]() {
+          if (!pinned_mem_ || pinned_mem_->num_chunks() == 0) {
+            LOG(ERROR) << "CPU memory not allocated";
+            return 1;
+          }
+
+          auto& host_buffers = pin->get();
+          size_t loaded_size = 0;
+
+          while (true) {
+            auto [chunk_id, chunk_offset, size, dst_offset, handle_idx] =
+                cpu_copy_queue->dequeue();
+            if (size == 0) {
+              break;
+            }
+            std::memcpy(static_cast<char*>(dst_base) + dst_offset,
+                        host_buffers[chunk_id] + chunk_offset, size);
+            loaded_size += size;
+          }
+          LOG(INFO) << thread_idx << " loaded " << loaded_size << " bytes";
+          return 0;
+        }));
+  }
+
+  LOG(INFO) << "Waiting for model " << model_path_ << " to be loaded to CPU";
+  dispatch_future.wait();
+  bool error = false;
+  for (auto& future : futures) {
+    int ret = future.get();
+    if (ret != 0) {
+      LOG(ERROR) << "Error copying to CPU";
+      error = true;
+    }
+  }
+  futures.clear();
+
+  lock.lock();
+  if (error) {
+    LOG(ERROR) << "Failed to load model " << model_path_;
+    cpu_state_ = MemoryState::INTERRUPTED;
+  } else {
+    LOG(INFO) << "Finished loading tensor from host to client memory";
+    cpu_state_ = MemoryState::LOADED;
+  }
+  cv_.notify_all();
+  lock.unlock();
+
+  close(fd);
+  munmap(dst_base, shm_size);
+
+  return error ? -1 : 0;
+}
+
+int Model::WaitInHost() {
+  std::unique_lock<std::mutex> lock(mutex_);
+  if (state_ == MemoryState::LOADING) {
+    cv_.wait(lock, [this] { return state_ != MemoryState::LOADING; });
+  }
+
+  if (state_ != MemoryState::LOADED) {
+    LOG(INFO) << "Model " << model_path_ << " is not loaded to host, state "
+              << state_;
     return 1;
   }
 
@@ -420,6 +557,21 @@ int Model::WaitInGpu(const std::string& replica_uuid) {
 
   if (gpu_replica->state_ >= MemoryState::INTERRUPTED) {
     LOG(INFO) << "Model " << model_path_ << " is interrupted";
+    return 1;
+  }
+
+  return 0;
+}
+
+int Model::WaitInCpu() {
+  std::unique_lock<std::mutex> lock(mutex_);
+  cv_.wait(lock, [this] {
+    return cpu_state_ == MemoryState::LOADED ||
+           cpu_state_ == MemoryState::INTERRUPTED;
+  });
+
+  if (cpu_state_ == MemoryState::INTERRUPTED) {
+    LOG(ERROR) << "Model " << model_path_ << " is interrupted";
     return 1;
   }
 

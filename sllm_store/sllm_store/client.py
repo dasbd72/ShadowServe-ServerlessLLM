@@ -15,6 +15,7 @@
 #  See the License for the specific language governing permissions and         #
 #  limitations under the License.                                              #
 # ---------------------------------------------------------------------------- #
+import time
 
 import grpc
 import sllm_store.proto.storage_pb2 as storage_pb2
@@ -113,16 +114,62 @@ class SllmStoreClient:
             logger.info(f"Model loaded: {model_path}, {replica_uuid}")
             return response
 
-    def confirm_model_loaded(self, model_path, replica_uuid):
-        logger.info(f"confirm_model_loaded: {model_path}, {replica_uuid}")
-        request = storage_pb2.ConfirmModelRequest(
+    def load_into_client_host_shm(
+        self, model_path, posix_shm_name, shm_size, tensor_copy_chunks
+    ):
+        """Copy staged host weights into client POSIX shm.
+
+        See torch.load_dict."""
+        logger.debug(
+            f"load_into_client_host_shm: {model_path}, shm={posix_shm_name}, "
+            f"size={shm_size}"
+        )
+        chunk_list = storage_pb2.MemCopyChunkList(
+            chunks=[
+                storage_pb2.MemCopyChunk(
+                    src_offset=int(a),
+                    size=int(b),
+                    dst_offset=int(c),
+                    handle_idx=int(d),
+                )
+                for (a, b, c, d) in tensor_copy_chunks
+            ]
+        )
+        request = storage_pb2.LoadModelRequest(
             model_path=model_path,
-            replica_uuid=replica_uuid,
-            target_device_type=storage_pb2.DeviceType.DEVICE_TYPE_GPU,
+            target_device_type=storage_pb2.DeviceType.DEVICE_TYPE_CLIENT_HOST_SHM,
+            client_host_shm_name=posix_shm_name,
+            client_host_shm_size=int(shm_size),
+            chunks={"": chunk_list},
         )
         try:
+            response = self.stub.LoadModelAsync(request)
+        except grpc.RpcError as e:
+            if e.code() == grpc.StatusCode.CANCELLED:
+                logger.error(f"Model not loaded {e}")
+                return False
+            logger.error(f"Error: {e}")
+            return False
+        return response
+
+    def confirm_model_loaded(self, model_path, replica_uuid):
+        logger.info(f"confirm_model_loaded: {model_path}, {replica_uuid}")
+        if replica_uuid:
+            request = storage_pb2.ConfirmModelRequest(
+                model_path=model_path,
+                replica_uuid=replica_uuid,
+                target_device_type=storage_pb2.DeviceType.DEVICE_TYPE_GPU,
+            )
+        else:
+            request = storage_pb2.ConfirmModelRequest(
+                model_path=model_path,
+                target_device_type=storage_pb2.DeviceType.DEVICE_TYPE_CLIENT_HOST_SHM,
+            )
+        try:
+            start_time = time.perf_counter()
             _ = self.stub.ConfirmModel(request)
-            logger.info("Model loaded")
+            confirm_duration = time.perf_counter() - start_time
+            logger.info(f"Model confirm took {confirm_duration}s")
         except grpc.RpcError as e:
             if e.code() == grpc.StatusCode.CANCELLED:
                 logger.error("Model not loaded")

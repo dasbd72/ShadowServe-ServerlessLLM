@@ -101,6 +101,38 @@ class StorageServicer(storage_pb2_grpc.StorageServicer):
             ret = self.storage.load_model_from_mem_async(
                 model_path, replica_uuid, gpu_memory_handles, mem_copy_chunks
             )
+        elif device_type == storage_pb2.DEVICE_TYPE_CLIENT_HOST_SHM:
+            shm_name = (request.client_host_shm_name or "").strip()
+            shm_size = int(request.client_host_shm_size)
+            if not shm_name or shm_size <= 0:
+                logger.error(
+                    "client_host_shm_name or client_host_shm_size invalid"
+                )
+                context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+                return storage_pb2.LoadModelResponse()
+
+            def create_mem_copy_chunk(chunk):
+                mem_copy_chunk = MemCopyChunk()
+                mem_copy_chunk.src_offset = chunk.src_offset
+                mem_copy_chunk.size = chunk.size
+                mem_copy_chunk.dst_offset = chunk.dst_offset
+                mem_copy_chunk.handle_idx = chunk.handle_idx
+                return mem_copy_chunk
+
+            merged_chunks = []
+            for map_key in sorted(request.chunks.keys()):
+                chunk_list = request.chunks[map_key]
+                merged_chunks.extend(
+                    create_mem_copy_chunk(c) for c in chunk_list.chunks
+                )
+            if not merged_chunks:
+                logger.error("No mem copy chunks for CLIENT_HOST_SHM load")
+                context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+                return storage_pb2.LoadModelResponse()
+
+            ret = self.storage.load_model_into_client_host_shm_async(
+                model_path, shm_name, shm_size, merged_chunks
+            )
         else:
             logger.error(f"Unsupported device type: {device_type}")
             context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -126,26 +158,46 @@ class StorageServicer(storage_pb2_grpc.StorageServicer):
             context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
             return storage_pb2.ConfirmModelResponse()
 
-        if device_type != storage_pb2.DEVICE_TYPE_GPU:
-            logger.error(f"Unsupported device type: {device_type}")
-            context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        if device_type == storage_pb2.DEVICE_TYPE_GPU:
+            for i in range(5):
+                ret = self.storage.wait_model_in_gpu(model_path, replica_uuid)
+                if ret == 0:
+                    logger.info(
+                        f"Confirm model {model_path} "
+                        f"replica {replica_uuid} success"
+                    )
+                    return storage_pb2.ConfirmModelResponse(
+                        model_path=model_path, code=0
+                    )
+                logger.info(f"Confirm model failed, retry {i + 1}")
+
+                await asyncio.sleep(0.05)
+
+            logger.error(
+                f"Confirm model {model_path} replica {replica_uuid} failed"
+            )
+            context.set_code(grpc.StatusCode.INTERNAL)
             return storage_pb2.ConfirmModelResponse()
 
-        for i in range(5):
-            ret = self.storage.wait_model_in_gpu(model_path, replica_uuid)
-            if ret == 0:
-                logger.info(
-                    f"Confirm model {model_path} replica {replica_uuid} success"
-                )
-                return storage_pb2.ConfirmModelResponse(model_path=model_path)
-            logger.info(f"Confirm model failed, retry {i + 1}")
+        if device_type == storage_pb2.DEVICE_TYPE_CLIENT_HOST_SHM:
+            for i in range(5):
+                ret = self.storage.wait_model_client_host_shm(model_path)
+                if ret == 0:
+                    logger.info(
+                        f"Confirm client host shm copy done for {model_path}"
+                    )
+                    return storage_pb2.ConfirmModelResponse(
+                        model_path=model_path, code=0
+                    )
+                logger.info(f"Confirm client host shm failed, retry {i + 1}")
+                await asyncio.sleep(0.05)
 
-            await asyncio.sleep(0.05)
+            logger.error(f"Confirm client host shm failed for {model_path}")
+            context.set_code(grpc.StatusCode.INTERNAL)
+            return storage_pb2.ConfirmModelResponse()
 
-        logger.error(
-            f"Confirm model {model_path} replica {replica_uuid} failed"
-        )
-        context.set_code(grpc.StatusCode.INTERNAL)
+        logger.error(f"Unsupported device type: {device_type}")
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         return storage_pb2.ConfirmModelResponse()
 
     async def UnloadModel(self, request, context):

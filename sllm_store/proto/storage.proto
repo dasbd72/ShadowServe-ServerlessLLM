@@ -34,6 +34,8 @@ enum DeviceType {
   DEVICE_TYPE_DISK = 0;
   DEVICE_TYPE_CPU = 1;
   DEVICE_TYPE_GPU = 2;
+  // Client-created POSIX shared memory; server memcpy from staged host pool.
+  DEVICE_TYPE_CLIENT_HOST_SHM = 3;
 }
 
 message MemCopyChunk {
@@ -59,6 +61,11 @@ message LoadModelRequest {
   map<string, MemCopyChunkList> chunks = 3;
   map<string, MemCopyHandleList> handles = 4;
   DeviceType target_device_type = 5;
+  // For DEVICE_TYPE_CLIENT_HOST_SHM: POSIX shm object name (e.g. /psm_...) and
+  // size in bytes (must match client ftruncate). Chunk lists live in `chunks`
+  // (any map key; server merges all lists in sorted key order).
+  string client_host_shm_name = 6;
+  uint64 client_host_shm_size = 7;
 }
 
 message LoadModelResponse {

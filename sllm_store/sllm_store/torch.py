@@ -16,10 +16,13 @@
 #  limitations under the License.                                              #
 # ---------------------------------------------------------------------------- #
 import collections
+import contextlib
 import json
+import math
 import os
 import time
 import uuid
+from multiprocessing import shared_memory
 from typing import Dict, Optional, Union
 
 import torch
@@ -42,9 +45,74 @@ from sllm_store.utils import (
 
 logger = init_logger(__name__)
 
+# Slab key for CPU-only loads; must not collide with CUDA indices 0..N-1.
+_CPU_SLAB_DEVICE_ID = -1
+
 
 def _get_uuid():
     return str(uuid.uuid4())
+
+
+def _is_cpu_device(device: Union[int, str, torch.device]) -> bool:
+    if device == _CPU_SLAB_DEVICE_ID:
+        return True
+    if isinstance(device, str):
+        return torch.device(device).type == "cpu"
+    if isinstance(device, torch.device):
+        return device.type == "cpu"
+    return False
+
+
+def _cpu_device_map_or_none(
+    expanded: Dict[str, Union[int, str, torch.device]],
+) -> Optional[Dict[str, int]]:
+    cpu_device_map = {}
+    has_cpu = False
+    has_non_cpu = False
+    for name, dev in expanded.items():
+        if _is_cpu_device(dev):
+            cpu_device_map[name] = _CPU_SLAB_DEVICE_ID
+            has_cpu = True
+        else:
+            has_non_cpu = True
+    if has_cpu and has_non_cpu:
+        raise ValueError("CPU and GPU device_map entries cannot be mixed.")
+    return cpu_device_map if has_cpu else None
+
+
+def _torch_dtype_from_str(dtype: str):
+    prefix = "torch."
+    if not dtype.startswith(prefix):
+        raise ValueError(f"Unsupported tensor dtype: {dtype}")
+    return getattr(torch, dtype[len(prefix) :])
+
+
+def _restore_cpu_tensors(
+    tensor_meta_index,
+    slab: shared_memory.SharedMemory,
+    tensor_device_offsets,
+):
+    state_dict = {}
+    for tensor_offsets in tensor_device_offsets.values():
+        for name, offset in tensor_offsets.items():
+            shape, stride, dtype = tensor_meta_index[name]
+            shape = tuple(shape)
+            stride = tuple(stride)
+            numel = math.prod(shape)
+            torch_dtype = _torch_dtype_from_str(dtype)
+            if numel == 0:
+                state_dict[name] = torch.empty_strided(
+                    shape, stride, dtype=torch_dtype
+                )
+                continue
+            tensor = torch.frombuffer(
+                slab.buf,
+                dtype=torch_dtype,
+                count=numel,
+                offset=int(offset),
+            )
+            state_dict[name] = torch.as_strided(tensor, shape, stride)
+    return state_dict
 
 
 def save_dict(
@@ -89,7 +157,7 @@ def save_dict(
 
 def load_dict(
     model_path: Union[str, os.PathLike],
-    device_map: Dict[str, int],
+    device_map: Dict[str, Union[int, str, torch.device]],
     storage_path: Optional[str] = None,
 ):
     replica_uuid, state_dict = load_dict_non_blocking(
@@ -104,7 +172,7 @@ def load_dict(
 
 def load_dict_non_blocking(
     model_path: Optional[Union[str, os.PathLike]],
-    device_map: Dict[str, int],
+    device_map: Dict[str, Union[int, str, torch.device]],
     storage_path: Optional[str] = None,
 ):
     client = SllmStoreClient("127.0.0.1:8073")
@@ -125,10 +193,57 @@ def load_dict_non_blocking(
         tensor_meta_index[name] = (shape, stride, dtype)
         tensor_data_index[name] = (offset, size)
 
-    start = time.time()
     expanded_device_map = _expand_tensor_name(
         device_map, list(tensor_index.keys())
     )
+    cpu_device_map = _cpu_device_map_or_none(expanded_device_map)
+
+    if cpu_device_map is not None:
+        start = time.perf_counter()
+        tensor_device_offsets, tensor_copy_chunks = (
+            calculate_tensor_device_offsets(cpu_device_map, tensor_data_index)
+        )
+        chunks = tensor_copy_chunks[_CPU_SLAB_DEVICE_ID]
+        slab_size = max(
+            (dst_offset + size for _, size, dst_offset, _ in chunks),
+            default=1,
+        )
+
+        sm = shared_memory.SharedMemory(create=True, size=slab_size)
+        try:
+            t_load = time.perf_counter()
+            ret = client.load_into_client_host_shm(
+                model_path, sm.name, sm.size, chunks
+            )
+            if not ret:
+                raise ValueError(
+                    f"Failed to load model {model_path} into client host shm"
+                )
+            t_restore = time.perf_counter()
+            state_dict = _restore_cpu_tensors(
+                tensor_meta_index, sm, tensor_device_offsets
+            )
+            for v in state_dict.values():
+                if isinstance(v, torch.Tensor):
+                    v._sllm_host_shared_memory = sm
+            with contextlib.suppress(FileNotFoundError):
+                sm.unlink()
+            logger.info(
+                "Allocate shared memory took "
+                f"{t_load - start:.4f}s "
+                f"RPC took {t_restore - t_load:.4f}s "
+                f"restore took {time.perf_counter() - t_restore:.4f}s "
+                f"total took {time.perf_counter() - start:.4f}s"
+            )
+            return "", state_dict
+        except Exception:
+            with contextlib.suppress(Exception):
+                sm.close()
+            with contextlib.suppress(FileNotFoundError):
+                sm.unlink()
+            raise
+
+    start = time.perf_counter()
     device_memory = calculate_device_memory(
         expanded_device_map, tensor_data_index
     )
@@ -141,8 +256,8 @@ def load_dict_non_blocking(
     tensor_device_offsets, tensor_copy_chunks = calculate_tensor_device_offsets(
         expanded_device_map, tensor_data_index
     )
-    logger.debug(f"allocate_cuda_memory takes {time.time() - start} seconds")
 
+    t_load = time.perf_counter()
     replica_uuid = _get_uuid()
     ret = client.load_into_gpu(
         model_path,
@@ -160,7 +275,7 @@ def load_dict_non_blocking(
         raise ValueError(f"Failed to load model {model_path} into GPU")
 
     # load model state_dict
-    start = time.time()
+    t_restore = time.perf_counter()
     state_dict = restore_tensors(
         tensor_meta_index, cuda_memory_ptrs, tensor_device_offsets
     )
@@ -178,6 +293,12 @@ def load_dict_non_blocking(
             for k in keys:
                 state_dict[k] = state_dict[k].clone()
 
-    logger.info(f"restore state_dict takes {time.time() - start} seconds")
+    logger.info(
+        "Allocate cuda memory took "
+        f"{t_load - start:.4f}s "
+        f"RPC took {t_restore - t_load:.4f}s "
+        f"restore took {time.perf_counter() - t_restore:.4f}s "
+        f"total took {time.perf_counter() - start:.4f}s"
+    )
 
     return replica_uuid, state_dict

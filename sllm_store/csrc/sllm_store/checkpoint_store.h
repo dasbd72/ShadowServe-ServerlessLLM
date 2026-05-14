@@ -56,6 +56,15 @@ class CheckpointStore {
                             const MemCopyChunkListMap& mem_copy_chunks);
   int WaitModelInGpu(const std::string& model_path,
                      const std::string& replica_uuid);
+  int LoadModelIntoClientHostShm(const std::string& model_path,
+                                 const std::string& posix_shm_name,
+                                 size_t shm_size,
+                                 const MemCopyChunkList& chunks);
+  int LoadModelIntoClientHostShmAsync(const std::string& model_path,
+                                      const std::string& posix_shm_name,
+                                      size_t shm_size,
+                                      const MemCopyChunkList& chunks);
+  int WaitModelClientHostShm(const std::string& model_path);
   int UnloadModelFromHost(const std::string& model_path);
   int ClearMem();
 

@@ -24,6 +24,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <exception>
 #include <filesystem>
 #include <thread>
 
@@ -258,6 +259,62 @@ int CheckpointStore::LoadModelFromMemAsync(
   return 0;
 }
 
+int CheckpointStore::LoadModelIntoClientHostShm(
+    const std::string& model_path, const std::string& posix_shm_name,
+    size_t shm_size, const MemCopyChunkList& mem_copy_chunk_list) {
+  // Sanity check
+  if (model_path.empty()) {
+    LOG(ERROR) << "Model name is empty";
+    return -1;
+  }
+  if (posix_shm_name.empty()) {
+    LOG(ERROR) << "Posix shm name is empty";
+    return -1;
+  }
+  if (shm_size == 0) {
+    LOG(ERROR) << "Shm size is 0";
+    return -1;
+  }
+  if (mem_copy_chunk_list.empty()) {
+    LOG(ERROR) << "No memory copy chunks provided";
+    return -1;
+  }
+  std::unique_lock<std::mutex> lock_info(model_info_mutex_);
+  auto model = GetModelPtr(model_path);
+  if (model == nullptr) {
+    LOG(ERROR) << "Model " << model_path << " is not registered";
+    return -1;
+  }
+  model_last_access_time_[model_path] = std::chrono::system_clock::now();
+  lock_info.unlock();
+
+  LOG(INFO) << "Loading model " << model_path;
+
+  int ret =
+      model->ToCpu(posix_shm_name, shm_size, mem_copy_chunk_list, num_thread_);
+
+  if (ret != 0) {
+    LOG(ERROR) << "Failed to load model " << model_path
+               << " to client host shm";
+  }
+
+  return ret;
+}
+
+int CheckpointStore::LoadModelIntoClientHostShmAsync(
+    const std::string& model_path, const std::string& posix_shm_name,
+    size_t shm_size, const MemCopyChunkList& mem_copy_chunk_list) {
+  std::unique_lock<std::mutex> lock_info(model_info_mutex_);
+  async_tasks_.emplace(std::async(
+      std::launch::async,
+      [this, model_path, posix_shm_name, shm_size, mem_copy_chunk_list]() {
+        return LoadModelIntoClientHostShm(model_path, posix_shm_name, shm_size,
+                                          mem_copy_chunk_list);
+      }));
+
+  return 0;
+}
+
 int CheckpointStore::WaitModelInGpu(const std::string& model_path,
                                     const std::string& replica_uuid) {
   // check if the model is in memory
@@ -271,6 +328,19 @@ int CheckpointStore::WaitModelInGpu(const std::string& model_path,
   lock_info.unlock();
 
   return model->WaitInGpu(replica_uuid);
+}
+
+int CheckpointStore::WaitModelClientHostShm(const std::string& model_path) {
+  std::shared_ptr<Model> model;
+  std::unique_lock<std::mutex> lock_info(model_info_mutex_);
+  if (model_map_.find(model_path) == model_map_.end()) {
+    LOG(ERROR) << "Model " << model_path << " is not registered";
+    return 1;
+  }
+  model = model_map_[model_path];
+  lock_info.unlock();
+
+  return model->WaitInCpu();
 }
 
 int CheckpointStore::ClearMem() {
