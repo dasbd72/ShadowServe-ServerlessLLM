@@ -18,8 +18,6 @@
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
-from accelerate import infer_auto_device_map
-from accelerate.utils import get_balanced_memory, get_max_memory
 from sllm_store.logger import init_logger
 
 logger = init_logger(__name__)
@@ -91,6 +89,8 @@ def _compute_device_placement_from_map(
     """
 
     if isinstance(device_map, str):
+        from accelerate import infer_auto_device_map
+
         no_split_modules = model._get_no_split_modules(device_map)
         if device_map not in [
             "auto",
@@ -106,6 +106,8 @@ def _compute_device_placement_from_map(
         device_map_kwargs = {"no_split_module_classes": no_split_modules}
 
         if device_map != "sequential":
+            from accelerate.utils import get_balanced_memory
+
             max_memory = get_balanced_memory(
                 model,
                 dtype=target_dtype,
@@ -114,6 +116,8 @@ def _compute_device_placement_from_map(
                 **device_map_kwargs,
             )
         else:
+            from accelerate.utils import get_max_memory
+
             max_memory = get_max_memory(max_memory)
         device_map_kwargs["max_memory"] = max_memory
 
@@ -136,6 +140,8 @@ def _compute_device_placement_from_map_fast(
     """
 
     if isinstance(device_map, str):
+        from accelerate.utils import get_max_memory
+
         if device_map not in [
             "auto",
             "balanced",

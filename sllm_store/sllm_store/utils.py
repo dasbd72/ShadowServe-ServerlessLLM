@@ -21,12 +21,6 @@ from contextlib import suppress
 
 import torch
 from torch import nn
-from transformers import BitsAndBytesConfig
-from accelerate.utils import find_tied_parameters, set_module_tensor_to_device
-from transformers.quantizers.auto import AutoHfQuantizer
-from transformers.utils.quantization_config import (
-    QuantizationConfigMixin,
-)
 
 from sllm_store.client import SllmStoreClient
 
@@ -156,6 +150,8 @@ def get_no_split_modules(model, no_split_modules_list, parent_name=""):
 
 
 def get_tied_no_split_modules(model, no_split_modules):
+    from transformers import find_tied_parameters
+
     tied_parameters = find_tied_parameters(model)
     tied_modules = []
     for tied_param_group in tied_parameters:
@@ -258,6 +254,10 @@ def quantize(
     replica_uuid,
     logger,
 ):
+    from transformers import BitsAndBytesConfig
+    from transformers.quantizers.auto import AutoHfQuantizer
+    from transformers.utils.quantization_config import QuantizationConfigMixin
+
     if isinstance(quantization_config, dict):
         try:
             quantization_config = BitsAndBytesConfig.from_dict(
@@ -333,6 +333,8 @@ def quantize(
             )
 
         else:
+            from accelerate.utils import set_module_tensor_to_device
+
             set_module_tensor_to_device(model, name, param.device, param)
 
     # converting new biases
