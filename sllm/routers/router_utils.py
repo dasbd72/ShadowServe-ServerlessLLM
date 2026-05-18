@@ -52,7 +52,7 @@ class SllmRouter(ABC):
         pass
 
     @abstractmethod
-    async def inference(self, request_data: dict):
+    async def inference(self, request_data: dict, action: str):
         pass
 
     @abstractmethod
