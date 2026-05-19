@@ -46,8 +46,9 @@ from sllm.backends.backend_utils import (
     BackendStatus,
     SllmBackend,
 )
+from sllm.logger import init_logger
 
-logger = logging.getLogger("ray")
+logger = init_logger(__name__)
 
 
 def process_output(output: RequestOutput, model_name: str) -> Dict[str, Any]:
