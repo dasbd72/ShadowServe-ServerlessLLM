@@ -75,7 +75,8 @@ def init_logger(name: str):
     if _default_handler:
         _default_handler.setLevel(log_level)
 
-    logger.addHandler(_default_handler)
+    if _default_handler not in logger.handlers:
+        logger.addHandler(_default_handler)
     logger.propagate = False
 
     return logger
