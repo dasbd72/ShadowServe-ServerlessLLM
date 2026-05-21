@@ -2,6 +2,7 @@ import json
 import os
 import tempfile
 import time
+import uuid
 from typing import Dict, Set
 
 import GPUtil
@@ -74,7 +75,9 @@ def benchmark_disk_bandwidth(num_iterations=5):
     read_results = []
     try:
         temp_dir = tempfile.gettempdir()
-        temp_file = os.path.join(temp_dir, "disk_bandwidth_test.tmp")
+        temp_file = os.path.join(
+            temp_dir, f"disk_bandwidth_test_{uuid.uuid4()}.tmp"
+        )
         size = 100 * 1024 * 1024  # 100 MB
 
         for _ in range(num_iterations):
