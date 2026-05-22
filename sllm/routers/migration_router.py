@@ -56,6 +56,8 @@ class MigrationRouter(RoundRobinRouter):
 
         instance_allocation = self.loop.create_future()
         await self.request_queue.put(instance_allocation)
+        async with self.waiting_count_lock:
+            self.waiting_count += 1
         logger.info(f"Enqueued request for model {self.model_name}")
 
         instance_id = await instance_allocation
