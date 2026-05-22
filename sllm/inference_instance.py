@@ -40,6 +40,10 @@ def start_instance(
         from sllm.backends import TransformersBackend
 
         model_backend_cls = TransformersBackend
+    elif backend == "shadow":
+        from sllm.backends import ShadowBackend
+
+        model_backend_cls = ShadowBackend
     else:
         logger.error(f"Unknown backend: {backend}")
         raise ValueError(f"Unknown backend: {backend}")

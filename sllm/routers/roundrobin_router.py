@@ -16,9 +16,12 @@
 #  limitations under the license.                                              #
 # ---------------------------------------------------------------------------- #
 import asyncio
+import copy
+import json
 import logging
+import time
 import uuid
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import ray
 
@@ -79,6 +82,7 @@ class RoundRobinRouter(SllmRouter):
         self.starting_inference_instances: Dict[str, InstanceHandle] = {}  # type:ignore
         self.deleting_inference_instances: Dict[str, InstanceHandle] = {}  # type:ignore
         self.ready_inference_instances: Dict[str, InstanceHandle] = {}  # type:ignore
+        self.shadow_backend_instance: Optional[ray.actor.ActorHandle] = None  # type:ignore
         # Fine-tuning instance pools
         self.starting_ft_instances: Dict[str, InstanceHandle] = {}  # type:ignore
         self.deleting_ft_instances: Dict[str, InstanceHandle] = {}  # type:ignore
@@ -90,6 +94,9 @@ class RoundRobinRouter(SllmRouter):
 
         self.request_count = 0
         self.request_count_lock = asyncio.Lock()
+
+        self.waiting_count = 0
+        self.waiting_count_lock = asyncio.Lock()
 
         self.fine_tuning_count = 0
         self.fine_tuning_count_lock = asyncio.Lock()
@@ -105,6 +112,17 @@ class RoundRobinRouter(SllmRouter):
         self.lora_lock = asyncio.Lock()
 
         self.auto_scaler = None
+        self.shadow_scale_up = router_config.get("shadow_scale_up", False)
+        self.shadow_num_cpus = router_config.get(
+            "shadow_num_cpus",
+            resource_requirements.get("num_cpus", 1),
+        )
+        self.migration_id_counter = 0
+        self.migration_id_lock = asyncio.Lock()
+        self.migrated_request_targets: Dict[
+            str, tuple[InstanceHandle, asyncio.Event]
+        ] = {}
+        self.migrated_request_lock = asyncio.Lock()
         logger.info(f"Created new handler for model {self.model_name}")
 
     async def start(
@@ -116,6 +134,10 @@ class RoundRobinRouter(SllmRouter):
                 self.auto_scaling_config = auto_scaling_config
             self.auto_scaler = asyncio.create_task(self._auto_scaler_loop())
             self.load_balancer = asyncio.create_task(self._load_balancer_loop())
+            if self.shadow_scale_up and self.backend == "vllm":
+                self.create_shadow_task = asyncio.create_task(
+                    self._create_shadow_instance()
+                )
         async with self.running_lock:
             self.running = True
         logger.info(f"Started handler for model {self.model_name}")
@@ -154,6 +176,8 @@ class RoundRobinRouter(SllmRouter):
 
         instance_allocation = self.loop.create_future()
         await self.request_queue.put(instance_allocation)
+        async with self.waiting_count_lock:
+            self.waiting_count += 1
         logger.info(f"Enqueued {action} request for model {self.model_name}")
 
         instance_id = await instance_allocation
@@ -181,6 +205,12 @@ class RoundRobinRouter(SllmRouter):
             result = await instance.backend_instance.generate.remote(
                 request_data=request_data
             )
+            if isinstance(result, dict) and "_sllm_migration" in result:
+                result = await self._resume_migrated_generate(
+                    result, request_data
+                )
+                # Set to none to avoid adding -1 to the instance
+                instance = None
         elif action == "encode":
             result = await instance.backend_instance.encode.remote(
                 request_data=request_data
@@ -188,10 +218,122 @@ class RoundRobinRouter(SllmRouter):
         else:
             result = {"error": "Invalid action"}
         logger.info(f"Finished processing request")
-        await instance.add_requests(-1)
+        if instance is not None:
+            await instance.add_requests(-1)
         async with self.request_count_lock:
             self.request_count -= 1
         return result
+
+    async def _resume_migrated_generate(
+        self, hot_result: dict, original_request_data: dict
+    ) -> dict:
+        migration_meta = hot_result.get("_sllm_migration") or {}
+        request_id: str | None = str(
+            migration_meta.get("external_request_id")
+            or migration_meta.get("request_id")
+            or hot_result.get("id")
+        )
+        if not request_id:
+            return self._strip_internal_response_fields(hot_result)
+        input_tokens: list[int] | None = migration_meta.get("input_tokens")
+        if not input_tokens:
+            return self._strip_internal_response_fields(hot_result)
+        completion_tokens: int | None = migration_meta.get("completion_tokens")
+        if not completion_tokens:
+            return self._strip_internal_response_fields(hot_result)
+
+        async with self.migrated_request_lock:
+            target = self.migrated_request_targets.get(request_id)
+        if target is None:
+            logger.error(
+                "No cold target found for migrated request %s", request_id
+            )
+            return self._strip_internal_response_fields(hot_result)
+
+        target_instance, kvstc_done = target
+        try:
+            async with asyncio.timeout(300):
+                await kvstc_done.wait()
+        except TimeoutError:
+            logger.error(
+                "Timed out waiting for KVSTC for request %s", request_id
+            )
+            return self._strip_internal_response_fields(hot_result)
+
+        if target_instance.backend_instance is None:
+            logger.error(
+                "Cold target has no backend for migrated request %s", request_id
+            )
+            return self._strip_internal_response_fields(hot_result)
+
+        cold_request_data = copy.deepcopy(original_request_data)
+        cold_request_data["request_id"] = request_id
+        cold_request_data["input_tokens"] = list(input_tokens)
+        self._adjust_remaining_tokens(cold_request_data, completion_tokens)
+
+        try:
+            cold_result = (
+                await target_instance.backend_instance.generate.remote(
+                    request_data=cold_request_data
+                )
+            )
+        finally:
+            await target_instance.add_requests(-1)
+            async with self.migrated_request_lock:
+                self.migrated_request_targets.pop(request_id, None)
+
+        return self._merge_migrated_generate_results(hot_result, cold_result)
+
+    def _strip_internal_response_fields(self, result: dict) -> dict:
+        result = copy.deepcopy(result)
+        result.pop("_sllm_migration", None)
+        return result
+
+    def _adjust_remaining_tokens(
+        self, request_data: dict, completed: int
+    ) -> None:
+        for key in ("max_tokens", "max_completion_tokens"):
+            if key not in request_data or request_data[key] is None:
+                continue
+            request_data[key] = max(1, int(request_data[key]) - completed)
+            break
+
+    def _merge_migrated_generate_results(
+        self, hot_result: dict, cold_result: Any
+    ) -> dict:
+        hot = self._strip_internal_response_fields(hot_result)
+        if not isinstance(cold_result, dict) or "error" in cold_result:
+            return cold_result if isinstance(cold_result, dict) else hot
+        cold = self._strip_internal_response_fields(cold_result)
+        hot_choices = hot.get("choices") or []
+        cold_choices = cold.get("choices") or []
+        for idx, hot_choice in enumerate(hot_choices):
+            if idx >= len(cold_choices):
+                continue
+            cold_choice = cold_choices[idx]
+            hot_msg = hot_choice.get("message", {})
+            cold_msg = cold_choice.get("message", {})
+            hot_msg["content"] = (hot_msg.get("content") or "") + (
+                cold_msg.get("content") or ""
+            )
+            hot_choice["message"] = hot_msg
+            hot_choice["finish_reason"] = cold_choice.get("finish_reason")
+            hot_choice["logprobs"] = cold_choice.get("logprobs")
+        hot_usage = hot.get("usage", {})
+        cold_usage = cold.get("usage", {})
+        if hot_usage or cold_usage:
+            assert hot_usage and cold_usage
+            prompt_tokens = int(hot_usage.get("prompt_tokens") or 0)
+            hot_completion = int(hot_usage.get("completion_tokens") or 0)
+            cold_completion = int(cold_usage.get("completion_tokens") or 0)
+            hot["usage"] = {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": hot_completion + cold_completion,
+                "total_tokens": prompt_tokens
+                + hot_completion
+                + cold_completion,
+            }
+        return hot
 
     async def fine_tuning(self, request_data: dict):
         logger.info(f"Starting fine-tuning for model {self.model_name}")
@@ -279,6 +421,8 @@ class RoundRobinRouter(SllmRouter):
         while not self.request_queue.empty():
             instance_allocation = await self.request_queue.get()
             instance_allocation.set_result({"error": "Instance cancelled"})
+            async with self.waiting_count_lock:
+                self.waiting_count -= 1
 
         async with self.instance_management_lock:
             deleted_instance_id = list(self.ready_inference_instances.keys())
@@ -321,6 +465,8 @@ class RoundRobinRouter(SllmRouter):
                         allocated = await instance.add_requests(1)
                         if allocated:
                             instance_allocation.set_result(instance_id)
+                            async with self.waiting_count_lock:
+                                self.waiting_count -= 1
                     else:
                         logger.info(
                             f"Instance {instance_id} cannot add another request"
@@ -414,7 +560,73 @@ class RoundRobinRouter(SllmRouter):
         logger.info(f"Created task for starting FT instance {instance_id}")
         return instance_id
 
+    async def _create_shadow_instance(self):
+        instance_id = self._new_instance_id()
+        logger.info(
+            f"Creating new shadow instance {instance_id} for model {self.model_name}"
+        )
+        t_allocate_resource = time.perf_counter()
+        startup_node = (
+            await self.model_loading_scheduler.allocate_resource.remote(
+                self.model_name,
+                instance_id,
+                {
+                    "num_cpus": self.shadow_num_cpus,
+                    "num_gpus": 0,
+                },
+            )
+        )
+        elapsed_allocate_resource = time.perf_counter() - t_allocate_resource
+
+        t_start_shadow_instance = time.perf_counter()
+        shadow_startup = {
+            "num_cpus": self.shadow_num_cpus,
+            "num_gpus": 0,
+            "resources": {
+                "worker_node": 0.1,
+                f"worker_id_{startup_node}": 0.1,
+            },
+        }
+        logger.info(
+            f"Shadow startup config: {shadow_startup}, {self.backend_config}"
+        )
+        await start_instance.options(
+            resources={
+                "worker_node": 0.1,
+                f"worker_id_{startup_node}": 0.1,
+            },
+        ).remote(
+            instance_id,
+            "shadow",
+            self.model_name,
+            self.backend_config,
+            shadow_startup,
+        )
+        logger.info(
+            f"Started shadow instance {instance_id} for model {self.model_name}"
+        )
+        elapsed_start_shadow_instance = (
+            time.perf_counter() - t_start_shadow_instance
+        )
+
+        t_init_shadow_backend = time.perf_counter()
+        self.shadow_backend_instance = ray.get_actor(instance_id)
+        await self.shadow_backend_instance.init_backend.remote()
+        elapsed_init_shadow_backend = (
+            time.perf_counter() - t_init_shadow_backend
+        )
+        timing_results = {
+            "allocate_resource": elapsed_allocate_resource,
+            "start_shadow_instance": elapsed_start_shadow_instance,
+            "init_shadow_backend": elapsed_init_shadow_backend,
+        }
+        logger.info(
+            f"Created shadow instance {instance_id} for model {self.model_name} "
+            f"{json.dumps(timing_results)}"
+        )
+
     async def _start_instance(self, instance_id):
+        t_total = time.perf_counter()
         async with self.instance_management_lock:
             if instance_id not in self.starting_inference_instances:
                 logger.error(f"Instance {instance_id} not found")
@@ -424,11 +636,53 @@ class RoundRobinRouter(SllmRouter):
         logger.info(
             f"Allocating resources for model {self.model_name} on instance {instance_id}"
         )
+        timing_results = {}
+        t_allocate_resource = time.perf_counter()
         startup_node = (
             await self.model_loading_scheduler.allocate_resource.remote(
                 self.model_name, instance_id, self.resource_requirements
             )
         )
+        timing_results["allocate_resource"] = (
+            time.perf_counter() - t_allocate_resource
+        )
+
+        shadow_scale_up_source = None
+        if self.shadow_scale_up and self.backend == "vllm":
+            async with self.instance_management_lock:
+                sources = list(self.ready_inference_instances.values())
+            if sources:
+                shadow_scale_up_source = max(
+                    sources, key=lambda h: h.concurrency
+                )
+
+        if shadow_scale_up_source:
+            results = await self._on_shadow_scale_up(
+                startup_node, shadow_scale_up_source, instance
+            )
+            timing_results.update(results)
+        else:
+            results = await self._start_backend_instance(startup_node, instance)
+            timing_results.update(results)
+
+        async with self.instance_management_lock:
+            self.ready_inference_instances[instance_id] = instance
+            self.starting_inference_instances.pop(instance_id)
+
+        timing_results["total"] = time.perf_counter() - t_total
+
+        # logging timing results
+        logger.info(
+            f"Started instance {instance_id} for model {self.model_name} "
+            f"{json.dumps(timing_results)}"
+        )
+        return instance_id
+
+    async def _start_backend_instance(
+        self, startup_node: str, instance: InstanceHandle
+    ):
+        t_start_backend_instance = time.perf_counter()
+        instance_id = instance.instance_id
         startup_config = {
             "num_cpus": self.resource_requirements["num_cpus"],
             "num_gpus": self.resource_requirements["num_gpus"],
@@ -451,19 +705,157 @@ class RoundRobinRouter(SllmRouter):
             self.backend_config,
             startup_config,
         )
-        logger.info(
-            f"Started instance {instance_id} for model {self.model_name}"
+        elapsed_start_backend_instance = (
+            time.perf_counter() - t_start_backend_instance
         )
+        logger.info(
+            f"Started instance {instance_id} for model {self.model_name} took "
+            f"{elapsed_start_backend_instance} seconds"
+        )
+        t_init_backend = time.perf_counter()
         instance.backend_instance = ray.get_actor(instance_id)
         async with instance.lock:
             instance.ready = True
             instance.node_id = startup_node
         await instance.backend_instance.init_backend.remote()
+        elapsed_init_backend = time.perf_counter() - t_init_backend
+        logger.info(
+            f"Initialized backend for instance {instance_id} for "
+            f"model {self.model_name} took {elapsed_init_backend} seconds"
+        )
+        return {
+            "start_backend_instance": elapsed_start_backend_instance,
+            "init_backend": elapsed_init_backend,
+        }
 
-        async with self.instance_management_lock:
-            self.ready_inference_instances[instance_id] = instance
-            self.starting_inference_instances.pop(instance_id)
-        return instance_id
+    async def _next_migration_id(self) -> int:
+        async with self.migration_id_lock:
+            self.migration_id_counter += 1
+            return self.migration_id_counter
+
+    def _kvhts_ipc_path_for_migration(self, migration_id: int) -> str:
+        prefix = self.router_config.get(
+            "kvhts_ipc_prefix", "/tmp/vllm-shadow-kvhts"
+        ).rstrip("/")
+        return f"{prefix}-{migration_id}.sock"
+
+    def _kvstc_ipc_path_for_migration(self, migration_id: int) -> str:
+        prefix = self.router_config.get(
+            "kvstc_ipc_prefix", "/tmp/vllm-shadow-kvstc"
+        ).rstrip("/")
+        return f"{prefix}-{migration_id}.sock"
+
+    async def _on_shadow_scale_up(
+        self,
+        startup_node: str,
+        source: InstanceHandle,
+        instance: InstanceHandle,
+    ) -> None:
+        migration_id = await self._next_migration_id()
+        logger.info(
+            "Shadow scale-up migration_id=%s source=%s instance=%s",
+            migration_id,
+            source.instance_id,
+            instance.instance_id,
+        )
+
+        start_backend_instance_task = asyncio.create_task(
+            self._start_backend_instance(startup_node, instance)
+        )
+
+        # start shadow migration
+        # kvhts migration
+        kvstc_done = asyncio.Event()
+        kvhts_path = self._kvhts_ipc_path_for_migration(migration_id)
+        # kvhts shadow side
+        t_kvhts_shadow_side = time.perf_counter()
+        await self.shadow_backend_instance.shadow_migration_recv.remote(
+            migration_id, kvhts_path
+        )
+        elapsed_kvhts_shadow_side = time.perf_counter() - t_kvhts_shadow_side
+        # kvhts hot side
+        async with self.waiting_count_lock:
+            num_waiting = self.waiting_count
+        if num_waiting <= 0:
+            return await start_backend_instance_task
+        t_kvhts_hot_side = time.perf_counter()
+        migrated_requests: list[
+            dict[str, int | str]
+        ] = await source.backend_instance.shadow_migration_migrate.remote(
+            migration_id, kvhts_path, num_waiting
+        )
+        elapsed_kvhts_hot_side = time.perf_counter() - t_kvhts_hot_side
+        if not migrated_requests:
+            return await start_backend_instance_task
+
+        async with self.migrated_request_lock:
+            for request in migrated_requests:
+                external_request_id = str(request["external_request_id"])
+                self.migrated_request_targets[external_request_id] = (
+                    instance,
+                    kvstc_done,
+                )
+
+        logger.info(
+            "Shadow scale-up KVHTS migrate started migration_id=%s requests=%s",
+            migration_id,
+            migrated_requests,
+        )
+
+        # wait for kvhts migration to be completed
+        async with asyncio.timeout(300):
+            while True:
+                completed = await self.shadow_backend_instance.shadow_migration_completed.remote()
+                if migration_id in completed.get(
+                    "completed_kvhts_sessions", []
+                ):
+                    break
+                await asyncio.sleep(0.5)
+        elapsed_kvhts_migration = time.perf_counter() - t_kvhts_shadow_side
+        await source.add_requests(-len(migrated_requests))
+
+        start_backend_instance_results = await start_backend_instance_task
+
+        # kvstc migration
+        await instance.add_requests(len(migrated_requests))
+        kvstc_path = self._kvstc_ipc_path_for_migration(migration_id)
+
+        # kvstc cold side
+        t_kvstc_cold_side = time.perf_counter()
+        await instance.backend_instance.shadow_migration_recv.remote(
+            migration_id, kvstc_path
+        )
+        elapsed_kvstc_cold_side = time.perf_counter() - t_kvstc_cold_side
+        # kvstc shadow side
+        t_kvstc_shadow_side = time.perf_counter()
+        await self.shadow_backend_instance.shadow_migration_migrate.remote(
+            migration_id, kvstc_path
+        )
+        elapsed_kvstc_shadow_side = time.perf_counter() - t_kvstc_shadow_side
+        logger.info(
+            "Shadow scale-up KVSTC migrate started migration_id=%s",
+            migration_id,
+        )
+
+        async with asyncio.timeout(300):
+            while True:
+                completed = await instance.backend_instance.shadow_migration_completed.remote()
+                if migration_id in completed.get(
+                    "completed_kvstc_sessions", []
+                ):
+                    break
+                await asyncio.sleep(0.5)
+        kvstc_done.set()
+        elapsed_kvstc_migration = time.perf_counter() - t_kvstc_cold_side
+
+        return {
+            "kvhts_shadow_side": elapsed_kvhts_shadow_side,
+            "kvhts_hot_side": elapsed_kvhts_hot_side,
+            "kvhts_migration": elapsed_kvhts_migration,
+            "kvstc_cold_side": elapsed_kvstc_cold_side,
+            "kvstc_shadow_side": elapsed_kvstc_shadow_side,
+            "kvstc_migration": elapsed_kvstc_migration,
+        } | start_backend_instance_results
 
     async def _start_ft_instance(self, instance_id: str):
         async with self.instance_management_lock:
