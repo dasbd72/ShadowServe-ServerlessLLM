@@ -340,14 +340,17 @@ class RoundRobinRouter(SllmRouter):
                 auto_scaling_metrics, auto_scaling_config
             )
             async with self.instance_management_lock:
-                num_running_instances = len(
-                    self.starting_inference_instances
-                ) + len(self.ready_inference_instances)
+                num_starting_instances = len(self.starting_inference_instances)
+                num_running_instances = len(self.ready_inference_instances)
             logger.info(
-                f"{self.model_name}: {num_running_instances} instances,"
-                f"need {desired_instances} instances",
+                f"{self.model_name}: {num_running_instances} running instances, "
+                f"{num_starting_instances} starting instances, "
+                f"{desired_instances} instances needed",
             )
-            if desired_instances > num_running_instances:
+            if (
+                desired_instances
+                > num_running_instances + num_starting_instances
+            ):
                 logger.info("Creating new instance")
                 await self._create_instance()
             elif desired_instances < num_running_instances:
@@ -534,8 +537,12 @@ class RoundRobinRouter(SllmRouter):
 
         async with self.instance_management_lock:
             if instance_id is None:
-                instance_id, instance = self.ready_inference_instances.popitem()
-            elif instance_id in self.ready_inference_instances:
+                # Stop the lowest concurrency instance if instance_id is not provided
+                instance_id = min(
+                    self.ready_inference_instances.keys(),
+                    key=lambda x: self.ready_inference_instances[x].concurrency,
+                )
+            if instance_id in self.ready_inference_instances:
                 instance = self.ready_inference_instances.pop(instance_id)
             else:
                 logger.error(f"Instance {instance_id} not found")
