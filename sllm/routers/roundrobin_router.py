@@ -333,7 +333,61 @@ class RoundRobinRouter(SllmRouter):
                 + hot_completion
                 + cold_completion,
             }
+        hot_metrics = hot.get("_sllm_metrics")
+        cold_metrics = cold.get("_sllm_metrics")
+        if hot_metrics or cold_metrics:
+            assert hot_metrics and cold_metrics
+            assert hot_usage and cold_usage
+            hot["_sllm_metrics"] = self._merge_sllm_metrics(
+                hot_metrics,
+                cold_metrics,
+                prompt_tokens,
+                hot_completion + cold_completion,
+            )
         return hot
+
+    def _merge_sllm_metrics(
+        self,
+        hot_metrics: dict | None,
+        cold_metrics: dict | None,
+        prompt_tokens: int,
+        completion_tokens: int,
+    ) -> dict:
+        hot_metrics = hot_metrics or {}
+        cold_metrics = cold_metrics or {}
+        arrival_ts = hot_metrics.get("_arrival_ts") or cold_metrics.get(
+            "_arrival_ts"
+        )
+        end_ts = cold_metrics.get("_end_ts") or hot_metrics.get("_end_ts", 0.0)
+        hot_first = hot_metrics.get("_first_token_ts") or 0.0
+        cold_first = cold_metrics.get("_first_token_ts") or 0.0
+        first_token_ts = None
+        for candidate in (hot_first, cold_first):
+            if candidate > 0.0 and (
+                first_token_ts is None or candidate < first_token_ts
+            ):
+                first_token_ts = candidate
+        if arrival_ts is None:
+            return {
+                "ttft_s": 0.0,
+                "tpot_s": 0.0,
+                "e2e_s": 0.0,
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+            }
+        ttft_s = (first_token_ts - arrival_ts) if first_token_ts else 0.0
+        e2e_s = end_ts - arrival_ts if end_ts else 0.0
+        if completion_tokens > 1 and first_token_ts is not None:
+            tpot_s = (end_ts - first_token_ts) / (completion_tokens - 1)
+        else:
+            tpot_s = 0.0
+        return {
+            "ttft_s": round(ttft_s, 6),
+            "tpot_s": round(tpot_s, 6),
+            "e2e_s": round(e2e_s, 6),
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+        }
 
     async def fine_tuning(self, request_data: dict):
         logger.info(f"Starting fine-tuning for model {self.model_name}")

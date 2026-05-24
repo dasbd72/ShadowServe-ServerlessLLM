@@ -50,6 +50,38 @@ from sllm.logger import init_logger
 logger = init_logger(__name__)
 
 
+def _count_completion_tokens(output: RequestOutput) -> int:
+    return sum(len(result.token_ids) for result in output.outputs)
+
+
+def _build_sllm_metrics(
+    arrival_ts: float,
+    first_token_ts: float | None,
+    end_ts: float,
+    output: RequestOutput,
+) -> Dict[str, float | int]:
+    prompt_tokens = len(output.prompt_token_ids)
+    completion_tokens = _count_completion_tokens(output)
+    ttft_s = (
+        (first_token_ts - arrival_ts) if first_token_ts is not None else 0.0
+    )
+    e2e_s = end_ts - arrival_ts
+    if completion_tokens > 1 and first_token_ts is not None:
+        tpot_s = (end_ts - first_token_ts) / (completion_tokens - 1)
+    else:
+        tpot_s = 0.0
+    return {
+        "ttft_s": round(ttft_s, 6),
+        "tpot_s": round(tpot_s, 6),
+        "e2e_s": round(e2e_s, 6),
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "_arrival_ts": arrival_ts,
+        "_first_token_ts": first_token_ts or 0.0,
+        "_end_ts": end_ts,
+    }
+
+
 def process_output(output: RequestOutput, model_name: str) -> Dict[str, Any]:
     choices: List[Dict[str, Any]] = [
         {
@@ -247,6 +279,7 @@ class VllmBackend(SllmBackend):
         request_id: str = request_data.pop(
             "request_id", f"chatcmpl-{uuid.uuid4()}"
         )
+        arrival_ts: float | None = request_data.pop("_sllm_arrival_ts", None)
 
         # OpenAI chat/completions uses max_completion_tokens; vLLM uses max_tokens.
         if "max_completion_tokens" in request_data:
@@ -267,16 +300,28 @@ class VllmBackend(SllmBackend):
 
         # Non-stream case
         final_output = None
+        first_token_ts: float | None = None
         async for response_output in results_generator:
+            if (
+                first_token_ts is None
+                and _count_completion_tokens(response_output) > 0
+            ):
+                first_token_ts = time.perf_counter()
             final_output = response_output
             await self.request_trace.update_status(request_id, response_output)
 
         assert final_output is not None
+        end_ts = time.perf_counter()
 
         if not self.trace_debug:
             await self.request_trace.delete_request(request_id)
 
-        return process_output(final_output, model_name)
+        api_response = process_output(final_output, model_name)
+        if arrival_ts is not None:
+            api_response["_sllm_metrics"] = _build_sllm_metrics(
+                arrival_ts, first_token_ts, end_ts, final_output
+            )
+        return api_response
 
     async def shutdown(self):
         """Abort all requests and shutdown the backend."""
