@@ -277,8 +277,8 @@ class RoundRobinRouter(SllmRouter):
         # stop all inference instances
         # return all unfinished requests
         while not self.request_queue.empty():
-            request_data, done_event = await self.request_queue.get()
-            done_event.set_result({"error": "Instance cancelled"})
+            instance_allocation = await self.request_queue.get()
+            instance_allocation.set_result({"error": "Instance cancelled"})
 
         async with self.instance_management_lock:
             deleted_instance_id = list(self.ready_inference_instances.keys())
