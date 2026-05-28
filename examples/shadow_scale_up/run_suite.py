@@ -22,15 +22,17 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+import psutil
+
 logger = logging.getLogger("run_suite.py")
 
 EXAMPLE_DIR = Path(__file__).resolve().parent
 ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_LOGS_DIR = ROOT / "logs"
+LOGS_DIR = ROOT / "logs"
 START_SLLM_SCRIPT = EXAMPLE_DIR / "start_sllm.py"
 
-DEFAULT_SLLM_STORE_PORT = 8073
-DEFAULT_SLLM_URL = os.environ.get("LLM_SERVER_URL", "http://127.0.0.1:8343")
+SLLM_PORT = 8343
+SLLM_URL = f"http://127.0.0.1:{SLLM_PORT}"
 
 DEFAULT_CONCURRENT = 4
 DEFAULT_MAX_TOKENS_QWEN3_0_6B = 16384
@@ -63,12 +65,28 @@ DEFAULT_MAX_TOKENS: dict[str, int] = {
 
 # RoundRobinRouter logs this after init_backend completes (see roundrobin_router.py).
 _DEPLOY_READY_RE = re.compile(
-    r"Started instance .+ for model {model} \{{.*\"total\":"
+    r"Initialized backend for instance .* for model {model}"
 )
 # Shadow handler logs this after shadow CPU backend init (roundrobin_router.py).
 _SHADOW_DEPLOY_READY_RE = re.compile(
     r"Created shadow instance .+ for model {model} .*\"init_shadow_backend\""
 )
+
+
+def kill_proc_tree(pid: int, sig: int = signal.SIGTERM) -> None:
+    try:
+        parent = psutil.Process(pid)
+        # Get all children and grandchildren recursively
+        children = parent.children(recursive=True)
+
+        # Kill all child processes first
+        for child in children:
+            child.send_signal(sig)
+
+        # Finally, kill the parent process
+        parent.send_signal(sig)
+    except psutil.NoSuchProcess:
+        pass
 
 
 @dataclass(frozen=True)
@@ -101,31 +119,29 @@ class _Tee(io.TextIOBase):
 class Context:
     def __init__(
         self,
-        logs_dir: Path,
         models: list[str],
         *,
-        sllm_store_port: int,
-        sllm_url: str,
         concurrent: int,
         stagger_ms: int,
         num_trigger_runs: int,
         max_tokens_by_model: dict[str, int],
     ) -> None:
-        self.logs_dir = logs_dir
         self.models = models
-        self.sllm_store_port = sllm_store_port
-        self.sllm_url = sllm_url.rstrip("/")
         self.concurrent = concurrent
         self.stagger_ms = stagger_ms
         self.num_trigger_runs = num_trigger_runs
         self.max_tokens_by_model = max_tokens_by_model
+
+        self.logs_dir = LOGS_DIR
+        self.sllm_url = SLLM_URL
+
         self._start_sllm_proc: subprocess.Popen | None = None
         self._shutdown_requested = False
 
-    def run_all(self) -> None:
+    def run(self) -> None:
         os.chdir(ROOT)
         self.logs_dir.mkdir(parents=True, exist_ok=True)
-        self._check_sllm_store()
+
         for scenario in self._suite_scenarios():
             if self._shutdown_requested:
                 break
@@ -182,16 +198,7 @@ class Context:
 
         scenario.sllm_log.parent.mkdir(parents=True, exist_ok=True)
 
-        start_cmd = [
-            sys.executable,
-            str(START_SLLM_SCRIPT),
-            "--deploy",
-            "--config",
-            str(scenario.config),
-            "--log-file",
-            str(scenario.sllm_log),
-        ]
-        self._start_sllm_proc = subprocess.Popen(start_cmd)
+        self._start_sllm(scenario.config, scenario.sllm_log)
         try:
             self._wait_sllm_health()
             self._wait_model_deployed(
@@ -212,64 +219,23 @@ class Context:
                     label=label,
                 )
         finally:
-            self._stop_start_sllm()
             if self._start_sllm_proc is not None:
-                self._start_sllm_proc.wait(timeout=60)
+                self._stop_sllm()
 
         finished = datetime.now().astimezone().isoformat(timespec="seconds")
         logger.info("==> %s finished scenario %s", finished, scenario.name)
 
-    def _run_trigger(
-        self,
-        model: str,
-        max_tokens: int,
-        log_file: Path,
-        *,
-        label: str,
-    ) -> None:
-        started = datetime.now().astimezone().isoformat(timespec="seconds")
-        logger.info(
-            "==> %s trigger (%s): model=%s max_tokens=%s -> %s",
-            started,
-            label,
-            model,
-            max_tokens,
-            log_file,
-        )
-        log_file.parent.mkdir(parents=True, exist_ok=True)
-        if str(EXAMPLE_DIR) not in sys.path:
-            sys.path.insert(0, str(EXAMPLE_DIR))
-        from trigger_scale_up import Context as TriggerContext
-
-        stamp = datetime.now().astimezone().isoformat(timespec="seconds")
-        trigger = TriggerContext(
-            url=self.sllm_url,
-            model=model,
-            concurrent=self.concurrent,
-            max_tokens=max_tokens,
-            timeout=TRIGGER_TIMEOUT_SEC,
-            stagger_ms=self.stagger_ms,
-        )
-
-        with log_file.open("w", encoding="utf-8") as log_fh:
-            log_fh.write(f"===== {stamp} =====\n")
-            log_fh.flush()
-            tee = _Tee(sys.stdout, log_fh)
-            with contextlib.redirect_stdout(tee):
-                asyncio.run(trigger.run())
-
-        finished = datetime.now().astimezone().isoformat(timespec="seconds")
-        logger.info("==> %s trigger finished -> %s", finished, log_file)
-
-    def _check_sllm_store(self) -> None:
-        host, port = "127.0.0.1", self.sllm_store_port
-        if self._port_listening(host, port):
-            logger.info("sllm-store is listening on %s:%s", host, port)
-            return
-        raise RuntimeError(
-            f"sllm-store is not listening on {host}:{port}. "
-            'Start it first, e.g.: sllm-store start --storage-path "$STORAGE_PATH"'
-        )
+    def _start_sllm(self, config: Path, log_file: Path) -> None:
+        start_cmd = [
+            sys.executable,
+            str(START_SLLM_SCRIPT),
+            "--deploy",
+            "--config",
+            str(config),
+            "--log-file",
+            str(log_file),
+        ]
+        self._start_sllm_proc = subprocess.Popen(start_cmd)
 
     def _wait_sllm_health(self) -> None:
         url = f"{self.sllm_url}/health"
@@ -347,31 +313,62 @@ class Context:
             f"(missing: {', '.join(missing)}; see {log_file})"
         )
 
-    @staticmethod
-    def _port_listening(host: str, port: int, timeout_sec: float = 1.0) -> bool:
-        try:
-            with socket.create_connection((host, port), timeout=timeout_sec):
-                return True
-        except OSError:
-            return False
-
-    def _stop_start_sllm(self) -> None:
+    def _stop_sllm(self) -> None:
         if self._start_sllm_proc is not None:
-            self._start_sllm_proc.send_signal(signal.SIGTERM)
+            kill_proc_tree(self._start_sllm_proc.pid)
+            self._start_sllm_proc.wait(timeout=60)
+            self._start_sllm_proc = None
+
+    def _run_trigger(
+        self,
+        model: str,
+        max_tokens: int,
+        log_file: Path,
+        *,
+        label: str,
+    ) -> None:
+        started = datetime.now().astimezone().isoformat(timespec="seconds")
+        logger.info(
+            "==> %s trigger (%s): model=%s max_tokens=%s -> %s",
+            started,
+            label,
+            model,
+            max_tokens,
+            log_file,
+        )
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        if str(EXAMPLE_DIR) not in sys.path:
+            sys.path.insert(0, str(EXAMPLE_DIR))
+        from trigger_scale_up import Context as TriggerContext
+
+        stamp = datetime.now().astimezone().isoformat(timespec="seconds")
+        trigger = TriggerContext(
+            url=self.sllm_url,
+            model=model,
+            concurrent=self.concurrent,
+            max_tokens=max_tokens,
+            timeout=TRIGGER_TIMEOUT_SEC,
+            stagger_ms=self.stagger_ms,
+        )
+
+        with log_file.open("w", encoding="utf-8") as log_fh:
+            log_fh.write(f"===== {stamp} =====\n")
+            log_fh.flush()
+            tee = _Tee(sys.stdout, log_fh)
+            with contextlib.redirect_stdout(tee):
+                asyncio.run(trigger.run())
+
+        finished = datetime.now().astimezone().isoformat(timespec="seconds")
+        logger.info("==> %s trigger finished -> %s", finished, log_file)
 
     def shutdown(self) -> None:
+        logger.info("Shutting down SLLM server and Ray cluster")
         self._shutdown_requested = True
-        self._stop_start_sllm()
+        self._stop_sllm()
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument(
-        "--logs-dir",
-        type=Path,
-        default=DEFAULT_LOGS_DIR,
-        help="Directory for per-run log files (default: <repo>/logs)",
-    )
     p.add_argument(
         "--model",
         dest="models",
@@ -383,17 +380,6 @@ def parse_args() -> argparse.Namespace:
             f"Choices: {', '.join(sorted(MODEL_SLUGS))}. "
             "Default: all models."
         ),
-    )
-    p.add_argument(
-        "--sllm-store-port",
-        type=int,
-        default=int(os.environ.get("SLLM_STORE_PORT", DEFAULT_SLLM_STORE_PORT)),
-        help=f"sllm-store gRPC port (default: {DEFAULT_SLLM_STORE_PORT})",
-    )
-    p.add_argument(
-        "--url",
-        default=DEFAULT_SLLM_URL,
-        help=f"SLLM server base URL (default: {DEFAULT_SLLM_URL})",
     )
     p.add_argument(
         "--concurrent",
@@ -449,6 +435,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     args = parse_args()
+
     models = args.models or sorted(MODEL_SLUGS)
     max_tokens_by_model = {
         "Qwen/Qwen3-0.6B": args.max_tokens_qwen3_0_6b,
@@ -456,10 +443,7 @@ def main() -> None:
         "Qwen/Qwen3-8B": args.max_tokens_qwen3_8b,
     }
     context = Context(
-        logs_dir=args.logs_dir,
         models=models,
-        sllm_store_port=args.sllm_store_port,
-        sllm_url=args.url,
         concurrent=args.concurrent,
         stagger_ms=args.stagger_ms,
         num_trigger_runs=args.num_trigger_runs,
@@ -474,7 +458,7 @@ def main() -> None:
     signal.signal(signal.SIGTERM, handle_signal)
 
     try:
-        context.run_all()
+        context.run()
     except Exception as exc:
         logger.error("run_suite failed: %s", exc)
         sys.exit(1)
