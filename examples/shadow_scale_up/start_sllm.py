@@ -69,6 +69,7 @@ class Context:
         self.head_process: subprocess.Popen | None = None
         self.worker_processes: list[subprocess.Popen] = []
         self.sllm_process: subprocess.Popen | None = None
+        self._shutdown_requested = False
 
     def run(self) -> None:
         os.chdir(ROOT)
