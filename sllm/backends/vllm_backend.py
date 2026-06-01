@@ -283,8 +283,9 @@ class VllmBackend(SllmBackend):
         requests = await self.request_trace.return_all_request_ids()
         tasks = [self.engine.abort(request_id) for request_id in requests]
         await asyncio.gather(*tasks)
-        if hasattr(self, "engine"):
-            del self.engine
+        if self.engine is not None:
+            self.engine.shutdown()
+            self.engine = None
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
