@@ -38,6 +38,7 @@ def start_server(
     port=8343,
     enable_storage_aware=False,
     enable_migration=False,
+    enable_shadow=False,
 ):
     """Start the SLLM server using Ray and uvicorn."""
     try:
@@ -61,6 +62,7 @@ def start_server(
             {
                 "enable_storage_aware": enable_storage_aware,
                 "enable_migration": enable_migration,
+                "enable_shadow": enable_shadow,
             }
         )
 
