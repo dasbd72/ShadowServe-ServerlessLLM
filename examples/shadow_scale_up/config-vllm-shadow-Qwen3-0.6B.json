@@ -1,0 +1,29 @@
+{
+    "model": "Qwen/Qwen3-0.6B",
+    "backend": "vllm",
+    "num_gpus": 1,
+    "auto_scaling_config": {
+        "metric": "concurrency",
+        "target": 2,
+        "min_instances": 2,
+        "max_instances": 4
+    },
+    "router_config": {
+        "shadow_scale_up": true,
+        "target": 2,
+        "shadow_num_cpus": 16,
+        "kvhts_ipc_prefix": "/tmp/vllm-shadow-kvhts",
+        "kvstc_ipc_prefix": "/tmp/vllm-shadow-kvstc",
+        "tksth_ipc_prefix": "/tmp/vllm-shadow-tksth",
+        "additional_blocks_per_request": 50
+    },
+    "backend_config": {
+        "pretrained_model_name_or_path": "Qwen/Qwen3-0.6B",
+        "torch_dtype": "bfloat16",
+        "enforce_eager": false,
+        "enable_prefix_caching": true,
+        "shadow_sender_enabled": true,
+        "shadow_receiver_enabled": true,
+        "block_size": 16
+    }
+}
