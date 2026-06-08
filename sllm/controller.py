@@ -25,7 +25,7 @@ import ray
 
 from sllm.fine_tuning_job_store import FineTuningJobStore
 from sllm.logger import init_logger
-from sllm.routers import MigrationRouter, RoundRobinRouter
+from sllm.routers import MigrationRouter, RoundRobinRouter, ShadowRouter
 from sllm.schedulers import FcfsScheduler, StorageAwareScheduler
 from sllm.store_manager import StoreManager
 
@@ -80,8 +80,11 @@ class SllmController:
         else:
             ray_scheduler_cls = ray.remote(FcfsScheduler)
 
+        enable_shadow = self.config.get("enable_shadow", False)
         enable_migration = self.config.get("enable_migration", False)
-        if enable_migration:
+        if enable_shadow:
+            self.router_cls = ray.remote(ShadowRouter)
+        elif enable_migration:
             self.router_cls = ray.remote(MigrationRouter)
         else:
             self.router_cls = ray.remote(RoundRobinRouter)

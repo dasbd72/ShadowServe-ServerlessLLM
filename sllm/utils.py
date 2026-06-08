@@ -73,6 +73,8 @@ class InstanceHandle:
     ready: bool = False
     concurrency: int = 0
 
+    shadow_backend_instance: Optional[ray.actor.ActorHandle] = None
+
     lock: asyncio.Lock = asyncio.Lock()
 
     async def add_requests(self, num_requests: int = 1):
