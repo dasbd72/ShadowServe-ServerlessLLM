@@ -16,7 +16,9 @@
 #  limitations under the license.                                              #
 # ---------------------------------------------------------------------------- #
 import asyncio
+import json
 import logging
+import time
 import uuid
 from typing import Dict, List, Optional
 
@@ -342,18 +344,27 @@ class RoundRobinRouter(SllmRouter):
             async with self.instance_management_lock:
                 num_starting_instances = len(self.starting_inference_instances)
                 num_running_instances = len(self.ready_inference_instances)
-            logger.info(
-                f"{self.model_name}: {num_running_instances} running instances, "
-                f"{num_starting_instances} starting instances, "
-                f"{desired_instances} instances needed",
-            )
-            if (
-                desired_instances
+
+            action = (
+                "create"
+                if desired_instances
                 > num_running_instances + num_starting_instances
-            ):
+                else "stop"
+                if desired_instances < num_running_instances
+                else None
+            )
+
+            if action:
+                logger.info(
+                    f"{self.model_name}: {num_running_instances} running instances, "
+                    f"{num_starting_instances} starting instances, "
+                    f"{desired_instances} instances needed",
+                )
+
+            if action == "create":
                 logger.info("Creating new instance")
                 await self._create_instance()
-            elif desired_instances < num_running_instances:
+            elif action == "stop":
                 keep_alive = auto_scaling_config.get("keep_alive", 0)
                 if self.idle_time >= keep_alive:
                     logger.info(
@@ -368,16 +379,10 @@ class RoundRobinRouter(SllmRouter):
                     )
                     async with self.idle_time_lock:
                         self.idle_time += self.loop_interval
-            else:
-                # logger.info("No scaling needed")
-                pass
             await asyncio.sleep(self.loop_interval)
 
     async def _create_instance(self):
         instance_id = self._new_instance_id()
-        logger.info(
-            f"Creating new instance {instance_id} for model {self.model_name}"
-        )
         # get max_queue_length from auto_scaling_config
         if self.auto_scaling_config.get("metric", "") == "concurrency":
             max_request_length = self.auto_scaling_config.get("target", 1)
@@ -415,6 +420,7 @@ class RoundRobinRouter(SllmRouter):
         return instance_id
 
     async def _start_instance(self, instance_id):
+        t_total = time.perf_counter()
         async with self.instance_management_lock:
             if instance_id not in self.starting_inference_instances:
                 logger.error(f"Instance {instance_id} not found")
@@ -424,11 +430,18 @@ class RoundRobinRouter(SllmRouter):
         logger.info(
             f"Allocating resources for model {self.model_name} on instance {instance_id}"
         )
+        timing_results = {}
+        t_allocate_resource = time.perf_counter()
         startup_node = (
             await self.model_loading_scheduler.allocate_resource.remote(
                 self.model_name, instance_id, self.resource_requirements
             )
         )
+        timing_results["allocate_resource"] = (
+            time.perf_counter() - t_allocate_resource
+        )
+
+        t_start_backend_instance = time.perf_counter()
         startup_config = {
             "num_cpus": self.resource_requirements["num_cpus"],
             "num_gpus": self.resource_requirements["num_gpus"],
@@ -451,18 +464,36 @@ class RoundRobinRouter(SllmRouter):
             self.backend_config,
             startup_config,
         )
-        logger.info(
-            f"Started instance {instance_id} for model {self.model_name}"
+        timing_results["start_backend_instance"] = (
+            time.perf_counter() - t_start_backend_instance
         )
+
+        t_init_backend = time.perf_counter()
         instance.backend_instance = ray.get_actor(instance_id)
         async with instance.lock:
             instance.ready = True
             instance.node_id = startup_node
         await instance.backend_instance.init_backend.remote()
+        timing_results["init_backend"] = elapsed_init_backend = (
+            time.perf_counter() - t_init_backend
+        )
+
+        logger.info(
+            f"Initialized backend for instance {instance_id} for "
+            f"model {self.model_name} took {elapsed_init_backend} seconds"
+        )
 
         async with self.instance_management_lock:
             self.ready_inference_instances[instance_id] = instance
             self.starting_inference_instances.pop(instance_id)
+
+        timing_results["total"] = time.perf_counter() - t_total
+
+        # logging timing results
+        logger.info(
+            f"Started instance {instance_id} for model {self.model_name} "
+            f"{json.dumps(timing_results)}"
+        )
         return instance_id
 
     async def _start_ft_instance(self, instance_id: str):

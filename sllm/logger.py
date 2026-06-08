@@ -22,9 +22,9 @@
 import logging
 import os
 import sys
+from datetime import datetime
 
 _FORMAT = "%(levelname)s %(asctime)s %(filename)s:%(lineno)d] %(message)s"
-_DATE_FORMAT = "%m-%d %H:%M:%S"
 
 
 class NewLineFormatter(logging.Formatter):
@@ -32,6 +32,12 @@ class NewLineFormatter(logging.Formatter):
 
     def __init__(self, fmt, datefmt=None):
         logging.Formatter.__init__(self, fmt, datefmt)
+
+    def formatTime(self, record, datefmt=None):
+        # ISO milliseconds '2026-06-08T20:56:01.976'
+        return datetime.fromtimestamp(record.created).strftime(
+            "%Y-%m-%dT%H:%M:%S.%f"
+        )[:-3]
 
     def format(self, record):
         msg = logging.Formatter.format(self, record)
@@ -54,7 +60,7 @@ def _setup_logger():
     _default_handler.setLevel(logging.DEBUG)
     _root_logger.addHandler(_default_handler)
 
-    fmt = NewLineFormatter(_FORMAT, datefmt=_DATE_FORMAT)
+    fmt = NewLineFormatter(_FORMAT)
     _default_handler.setFormatter(fmt)
     # Setting this will avoid the message
     # being propagated to the parent logger.

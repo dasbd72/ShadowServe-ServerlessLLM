@@ -152,13 +152,19 @@ def delete(models, lora_adapters):
     is_flag=True,
     help="Enable live migration of model instances.",
 )
-def start(host, port, enable_storage_aware, enable_migration):
+@click.option(
+    "--enable-shadow",
+    is_flag=True,
+    help="Enable shadow scaling of model instances.",
+)
+def start(host, port, enable_storage_aware, enable_migration, enable_shadow):
     """Start the head node of the SLLM cluster."""
     start_server(
         host=host,
         port=port,
         enable_storage_aware=enable_storage_aware,
         enable_migration=enable_migration,
+        enable_shadow=enable_shadow,
     )
 
 

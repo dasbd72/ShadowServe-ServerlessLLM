@@ -18,5 +18,6 @@
 from .migration_router import MigrationRouter
 from .roundrobin_router import RoundRobinRouter
 from .router_utils import SllmRouter
+from .shadow_router import ShadowRouter
 
-__all__ = ["SllmRouter", "RoundRobinRouter", "MigrationRouter"]
+__all__ = ["SllmRouter", "RoundRobinRouter", "MigrationRouter", "ShadowRouter"]

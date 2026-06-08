@@ -17,7 +17,6 @@
 # ---------------------------------------------------------------------------- #
 import asyncio
 import gc
-import inspect
 import logging
 import os
 import time
@@ -116,6 +115,13 @@ def process_output(output: RequestOutput, model_name: str) -> Dict[str, Any]:
             + sum(len(result.token_ids) for result in output.outputs),
         },
     }
+    if output.outputs and str(output.outputs[0].finish_reason) == "migrated":
+        output_token_ids = list(output.outputs[0].token_ids)
+        api_response["_sllm_migration"] = {
+            "external_request_id": output.request_id,
+            "input_tokens": list(output.prompt_token_ids) + output_token_ids,
+            "completion_tokens": len(output_token_ids),
+        }
     return api_response
 
 
@@ -418,3 +424,43 @@ class VllmBackend(SllmBackend):
             return {"error": "All inputs failed"}
 
         return process_embedding_output(valid_outputs, model_name)
+
+    async def shadow_migration_migrate(
+        self,
+        migration_id: int,
+        kvhts_ipc_path: str,
+        tksth_ipc_path: str,
+        max_requests: int | None = None,
+        additional_blocks_per_request: int = 0,
+    ) -> list[dict[str, int | str]]:
+        """Hot GPU: detach decode requests and send KV to shadow via KVHTS."""
+        async with self.status_lock:
+            if self.status != BackendStatus.RUNNING:
+                raise RuntimeError("Engine is not running")
+        assert self.engine is not None
+        return await self.engine.shadow_migration_migrate(
+            migration_id,
+            kvhts_ipc_path,
+            tksth_ipc_path,
+            max_requests,
+            additional_blocks_per_request,
+        )
+
+    async def shadow_migration_recv(
+        self, migration_id: int, kvstc_ipc_path: str
+    ) -> None:
+        """Cold GPU: listen for KVSTC from shadow CPU."""
+        async with self.status_lock:
+            if self.status != BackendStatus.RUNNING:
+                raise RuntimeError("Engine is not running")
+        assert self.engine is not None
+        await self.engine.shadow_migration_recv(migration_id, kvstc_ipc_path)
+
+    async def shadow_migration_completed(self) -> dict[str, list[int]]:
+        async with self.status_lock:
+            if self.status != BackendStatus.RUNNING:
+                return {
+                    "completed_kvstc_sessions": [],
+                }
+        assert self.engine is not None
+        return await self.engine.shadow_migration_completed()
