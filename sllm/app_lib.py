@@ -15,6 +15,7 @@
 #  see the license for the specific language governing permissions and         #
 #  limitations under the license.                                              #
 # ---------------------------------------------------------------------------- #
+import time
 from contextlib import asynccontextmanager
 
 import ray
@@ -115,6 +116,7 @@ def create_app() -> FastAPI:
 
     async def inference_handler(request: Request, action: str):
         body = await request.json()
+        body["_sllm_arrival_ts"] = time.perf_counter()
         model_name = body.get("model")
         logger.info(f"Received request for model {model_name}")
         if not model_name:
@@ -126,7 +128,24 @@ def create_app() -> FastAPI:
         logger.info(f"Got request router for {model_name}")
 
         result = request_router.inference.remote(body, action)
-        return await result
+        result = await result
+        if isinstance(result, dict):
+            metrics = result.get("_sllm_metrics")
+            if metrics:
+                logger.info(
+                    "request model=%s ttft=%.3fs tpot=%.3fs e2e=%.3fs "
+                    "prompt_tokens=%s completion_tokens=%s",
+                    model_name,
+                    metrics.get("ttft_s", 0.0),
+                    metrics.get("tpot_s", 0.0),
+                    metrics.get("e2e_s", 0.0),
+                    metrics.get("prompt_tokens"),
+                    metrics.get("completion_tokens"),
+                )
+                result["_sllm_metrics"] = {
+                    k: v for k, v in metrics.items() if not k.startswith("_")
+                }
+        return result
 
     async def fine_tuning_handler(request: Request):
         body = await request.json()
