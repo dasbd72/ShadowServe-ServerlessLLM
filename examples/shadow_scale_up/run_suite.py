@@ -39,9 +39,6 @@ SLLM_URL = f"http://127.0.0.1:{SLLM_PORT}"
 DEFAULT_NUM_WORKERS = 2
 DEFAULT_NUM_CPUS_PER_WORKER = 64
 DEFAULT_CUDA_DEVICES = "0,1"
-DEFAULT_MAX_TOKENS_QWEN3_0_6B = 16384
-DEFAULT_MAX_TOKENS_QWEN3_4B = 8192
-DEFAULT_MAX_TOKENS_QWEN3_8B = 4096
 DEFAULT_NUM_RUNS = 4
 DEFAULT_MIN_INSTANCES = 2
 DEFAULT_MAX_INSTANCES = 4
@@ -53,35 +50,6 @@ DEFAULT_DATASET_PATH = (
 HEALTH_TIMEOUT_SEC = 300.0
 DEPLOY_TIMEOUT_SEC = 900.0
 TRIGGER_TIMEOUT_SEC = 600.0
-
-MODEL_SLUGS: dict[str, str] = {
-    "Qwen/Qwen3-0.6B": "qwen3-0.6b",
-    "Qwen/Qwen3-4B": "qwen3-4b",
-    "Qwen/Qwen3-8B": "qwen3-8b",
-}
-
-MODEL_DEPLOY_SETTINGS: dict[str, dict[str, Any]] = {
-    "Qwen/Qwen3-0.6B": {
-        "shadow_num_cpus": 24,
-        "additional_blocks_per_request": 50,
-    },
-    "Qwen/Qwen3-4B": {
-        "max_model_len": 20480,
-        "shadow_num_cpus": 24,
-        "additional_blocks_per_request": 20,
-    },
-    "Qwen/Qwen3-8B": {
-        "max_model_len": 10240,
-        "shadow_num_cpus": 16,
-        "additional_blocks_per_request": 20,
-    },
-}
-
-DEFAULT_MAX_TOKENS: dict[str, int] = {
-    "Qwen/Qwen3-0.6B": DEFAULT_MAX_TOKENS_QWEN3_0_6B,
-    "Qwen/Qwen3-4B": DEFAULT_MAX_TOKENS_QWEN3_4B,
-    "Qwen/Qwen3-8B": DEFAULT_MAX_TOKENS_QWEN3_8B,
-}
 
 # RoundRobinRouter logs this after init_backend completes (see roundrobin_router.py).
 _BACKEND_DEPLOY_READY_RE = re.compile(
@@ -102,31 +70,32 @@ class Scenario:
     max_tokens: int
     sllm_log: Path
     client_log_base: Path
+    max_model_len: int | None = None
+    shadow_num_cpus: int | None = None
+    additional_blocks_per_request: int | None = None
 
 
 def _deploy_config(
-    model: str,
+    scenario: Scenario,
     *,
-    shadow: bool,
     min_instances: int,
     max_instances: int,
 ) -> dict[str, Any]:
-    settings = MODEL_DEPLOY_SETTINGS[model]
     backend_config: dict[str, Any] = {
-        "pretrained_model_name_or_path": model,
+        "pretrained_model_name_or_path": scenario.model,
         "torch_dtype": "bfloat16",
         "enforce_eager": False,
         "enable_prefix_caching": True,
         "block_size": 16,
     }
-    if max_model_len := settings.get("max_model_len"):
-        backend_config["max_model_len"] = max_model_len
-    if shadow:
+    if scenario.max_model_len is not None:
+        backend_config["max_model_len"] = scenario.max_model_len
+    if scenario.shadow:
         backend_config["shadow_sender_enabled"] = True
         backend_config["shadow_receiver_enabled"] = True
 
     config: dict[str, Any] = {
-        "model": model,
+        "model": scenario.model,
         "backend": "vllm",
         "num_gpus": 1,
         "auto_scaling_config": {
@@ -137,35 +106,39 @@ def _deploy_config(
         },
         "backend_config": backend_config,
     }
-    if shadow:
+    if scenario.shadow:
+        if (
+            scenario.shadow_num_cpus is None
+            or scenario.additional_blocks_per_request is None
+        ):
+            raise ValueError(
+                f"Shadow scenario {scenario.name!r} requires "
+                "shadow_num_cpus and additional_blocks_per_request"
+            )
         config["router_config"] = {
             "target": 2,
-            "shadow_num_cpus": settings["shadow_num_cpus"],
+            "shadow_num_cpus": scenario.shadow_num_cpus,
             "kvhts_ipc_prefix": "/tmp/vllm-shadow-kvhts",
             "kvstc_ipc_prefix": "/tmp/vllm-shadow-kvstc",
             "tksth_ipc_prefix": "/tmp/vllm-shadow-tksth",
-            "additional_blocks_per_request": settings[
-                "additional_blocks_per_request"
-            ],
+            "additional_blocks_per_request": scenario.additional_blocks_per_request,
         }
     return config
 
 
 @contextlib.contextmanager
 def _temp_deploy_config(
-    model: str,
+    scenario: Scenario,
     *,
-    shadow: bool,
     min_instances: int,
     max_instances: int,
 ):
     config = _deploy_config(
-        model,
-        shadow=shadow,
+        scenario,
         min_instances=min_instances,
         max_instances=max_instances,
     )
-    prefix = "config-vllm-shadow-" if shadow else "config-vllm-"
+    prefix = "config-vllm-shadow-" if scenario.shadow else "config-vllm-"
     with tempfile.NamedTemporaryFile(
         mode="w",
         suffix=".json",
@@ -185,24 +158,20 @@ def _temp_deploy_config(
 class Context:
     def __init__(
         self,
-        models: list[str],
         *,
         num_workers: int,
         num_cpus_per_worker: int,
         cuda_devices: str,
         num_runs: int,
         dataset_path: Path,
-        max_tokens_by_model: dict[str, int],
         min_instances: int,
         max_instances: int,
     ) -> None:
-        self.models = models
         self.num_workers = num_workers
         self.num_cpus_per_worker = num_cpus_per_worker
         self.cuda_devices = cuda_devices
         self.num_runs = num_runs
         self.dataset_path = dataset_path
-        self.max_tokens_by_model = max_tokens_by_model
         self.min_instances = min_instances
         self.max_instances = max_instances
 
@@ -224,33 +193,58 @@ class Context:
 
     def _suite_scenarios(self) -> list[Scenario]:
         scenarios: list[Scenario] = []
-        for model in self.models:
-            slug = MODEL_SLUGS[model]
-            max_tokens = self.max_tokens_by_model[model]
-            scenarios.append(
-                Scenario(
-                    name=f"baseline-{slug}",
-                    model=model,
-                    shadow=False,
-                    max_tokens=max_tokens,
-                    sllm_log=self.logs_dir
-                    / f"trigger_scale_up_baseline_sllm_{slug}.log",
-                    client_log_base=self.logs_dir
-                    / f"trigger_scale_up_baseline_client_{slug}",
-                )
+
+        scenarios.append(
+            Scenario(
+                name=f"baseline-qwen3-0.6b",
+                model="Qwen/Qwen3-0.6B",
+                shadow=False,
+                max_tokens=16384,
+                sllm_log=self.logs_dir / f"e2e_qwen3-0.6b_baseline_sllm.log",
+                client_log_base=self.logs_dir
+                / f"e2e_qwen3-0.6b_baseline_client.log",
             )
-            scenarios.append(
-                Scenario(
-                    name=f"shadow-{slug}",
-                    model=model,
-                    shadow=True,
-                    max_tokens=max_tokens,
-                    sllm_log=self.logs_dir
-                    / f"trigger_scale_up_shadow_sllm_{slug}.log",
-                    client_log_base=self.logs_dir
-                    / f"trigger_scale_up_shadow_client_{slug}",
-                )
+        )
+        scenarios.append(
+            Scenario(
+                name=f"shadow-qwen3-0.6b",
+                model="Qwen/Qwen3-0.6B",
+                shadow=True,
+                max_tokens=16384,
+                sllm_log=self.logs_dir / f"e2e_qwen3-0.6b_shadow_sllm.log",
+                client_log_base=self.logs_dir
+                / f"e2e_qwen3-0.6b_shadow_client.log",
+                shadow_num_cpus=64,
+                additional_blocks_per_request=50,
             )
+        )
+
+        scenarios.append(
+            Scenario(
+                name=f"baseline-qwen3-4b",
+                model="Qwen/Qwen3-4B",
+                shadow=False,
+                max_tokens=8192,
+                sllm_log=self.logs_dir / f"e2e_qwen3-4b_baseline_sllm.log",
+                client_log_base=self.logs_dir
+                / f"e2e_qwen3-4b_baseline_client.log",
+                max_model_len=20480,
+            )
+        )
+        scenarios.append(
+            Scenario(
+                name=f"shadow-qwen3-4b",
+                model="Qwen/Qwen3-4B",
+                shadow=True,
+                max_tokens=8192,
+                sllm_log=self.logs_dir / f"e2e_qwen3-4b_shadow_sllm.log",
+                client_log_base=self.logs_dir
+                / f"e2e_qwen3-4b_shadow_client.log",
+                max_model_len=20480,
+                shadow_num_cpus=24,
+                additional_blocks_per_request=20,
+            )
+        )
         return scenarios
 
     def _run_scenario(self, scenario: Scenario) -> None:
@@ -261,8 +255,7 @@ class Context:
 
         with (
             _temp_deploy_config(
-                scenario.model,
-                shadow=scenario.shadow,
+                scenario,
                 min_instances=self.min_instances,
                 max_instances=self.max_instances,
             ) as config,
@@ -513,18 +506,6 @@ class Context:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument(
-        "--model",
-        dest="models",
-        action="append",
-        choices=sorted(MODEL_SLUGS),
-        metavar="MODEL",
-        help=(
-            "Model to benchmark (repeatable). "
-            f"Choices: {', '.join(sorted(MODEL_SLUGS))}. "
-            "Default: all models."
-        ),
-    )
-    p.add_argument(
         "--num-workers",
         type=int,
         default=DEFAULT_NUM_WORKERS,
@@ -551,36 +532,6 @@ def parse_args() -> argparse.Namespace:
             "ShareGPT JSON dataset for workload_client.py "
             f"(default: {DEFAULT_DATASET_PATH}, or TRIGGER_DATASET_PATH)"
         ),
-    )
-    p.add_argument(
-        "--max-tokens-qwen3-0-6b",
-        type=int,
-        default=int(
-            os.environ.get(
-                "TRIGGER_MAX_TOKENS_QWEN3_0_6B", DEFAULT_MAX_TOKENS_QWEN3_0_6B
-            )
-        ),
-        help=f"max_tokens for Qwen3-0.6B (default: {DEFAULT_MAX_TOKENS_QWEN3_0_6B})",
-    )
-    p.add_argument(
-        "--max-tokens-qwen3-4b",
-        type=int,
-        default=int(
-            os.environ.get(
-                "TRIGGER_MAX_TOKENS_QWEN3_4B", DEFAULT_MAX_TOKENS_QWEN3_4B
-            )
-        ),
-        help=f"max_tokens for Qwen3-4B (default: {DEFAULT_MAX_TOKENS_QWEN3_4B})",
-    )
-    p.add_argument(
-        "--max-tokens-qwen3-8b",
-        type=int,
-        default=int(
-            os.environ.get(
-                "TRIGGER_MAX_TOKENS_QWEN3_8B", DEFAULT_MAX_TOKENS_QWEN3_8B
-            )
-        ),
-        help=f"max_tokens for Qwen3-8B (default: {DEFAULT_MAX_TOKENS_QWEN3_8B})",
     )
     p.add_argument(
         "--num-runs",
@@ -617,20 +568,12 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     args = parse_args()
 
-    models = args.models or sorted(MODEL_SLUGS)
-    max_tokens_by_model = {
-        "Qwen/Qwen3-0.6B": args.max_tokens_qwen3_0_6b,
-        "Qwen/Qwen3-4B": args.max_tokens_qwen3_4b,
-        "Qwen/Qwen3-8B": args.max_tokens_qwen3_8b,
-    }
     context = Context(
         num_workers=args.num_workers,
         num_cpus_per_worker=args.num_cpus_per_worker,
         cuda_devices=args.cuda_devices,
-        models=models,
         num_runs=args.num_runs,
         dataset_path=args.dataset_path,
-        max_tokens_by_model=max_tokens_by_model,
         min_instances=args.min_instances,
         max_instances=args.max_instances,
     )
