@@ -1,0 +1,19 @@
+{
+    "model": "Qwen/Qwen3-4B",
+    "backend": "vllm",
+    "num_gpus": 1,
+    "auto_scaling_config": {
+        "metric": "concurrency",
+        "target": 2,
+        "min_instances": 0,
+        "max_instances": 4
+    },
+    "backend_config": {
+        "pretrained_model_name_or_path": "Qwen/Qwen3-4B",
+        "torch_dtype": "bfloat16",
+        "enforce_eager": false,
+        "enable_prefix_caching": true,
+        "block_size": 16,
+        "max_model_len": 20480
+    }
+}
