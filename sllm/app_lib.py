@@ -15,12 +15,14 @@
 #  see the license for the specific language governing permissions and         #
 #  limitations under the license.                                              #
 # ---------------------------------------------------------------------------- #
+import json
 import time
 from contextlib import asynccontextmanager
 
 import ray
 import ray.exceptions
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import StreamingResponse
 
 from sllm.logger import init_logger
 
@@ -126,6 +128,23 @@ def create_app() -> FastAPI:
 
         request_router = ray.get_actor(model_name, namespace="models")
         logger.info(f"Got request router for {model_name}")
+
+        if action == "generate" and body.get("stream") is True:
+            result_generator = request_router.inference_stream.remote(
+                body, action
+            )
+
+            async def stream_results():
+                async for chunk_ref in result_generator:
+                    chunk = await chunk_ref
+                    yield f"data: {json.dumps(chunk)}\n\n"
+                    if isinstance(chunk, dict) and "error" in chunk:
+                        return
+                yield "data: [DONE]\n\n"
+
+            return StreamingResponse(
+                stream_results(), media_type="text/event-stream"
+            )
 
         result = request_router.inference.remote(body, action)
         result = await result

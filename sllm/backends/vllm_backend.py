@@ -125,6 +125,61 @@ def process_output(output: RequestOutput, model_name: str) -> Dict[str, Any]:
     return api_response
 
 
+def process_stream_chunk(
+    output: RequestOutput,
+    model_name: str,
+    previous_texts: List[str],
+    include_roles: List[bool],
+) -> tuple[Dict[str, Any], List[str], List[bool]]:
+    choices: List[Dict[str, Any]] = []
+    next_previous_texts = previous_texts[:]
+    next_include_roles = include_roles[:]
+
+    for idx, result in enumerate(output.outputs):
+        while idx >= len(next_previous_texts):
+            next_previous_texts.append("")
+        while idx >= len(next_include_roles):
+            next_include_roles.append(True)
+
+        previous_text = next_previous_texts[idx]
+        if result.text.startswith(previous_text):
+            content = result.text[len(previous_text) :]
+        else:
+            content = result.text
+
+        delta = {}
+        if next_include_roles[idx] and (
+            result.finish_reason is None or content
+        ):
+            delta["role"] = "assistant"
+            next_include_roles[idx] = False
+        if content:
+            delta["content"] = content
+
+        choices.append(
+            {
+                "index": idx,
+                "delta": delta,
+                "logprobs": result.logprobs,
+                "finish_reason": result.finish_reason,
+            }
+        )
+        next_previous_texts[idx] = result.text
+
+    api_response = {
+        "id": output.request_id,
+        "object": "chat.completion.chunk",
+        "created": (
+            int(time.time())
+            if output.metrics is None
+            else output.metrics.arrival_time
+        ),
+        "model": model_name,
+        "choices": choices,
+    }
+    return api_response, next_previous_texts, next_include_roles
+
+
 def process_embedding_output(
     outputs: List[EmbeddingRequestOutput], model_name: str
 ) -> Dict[str, Any]:
@@ -247,13 +302,7 @@ class VllmBackend(SllmBackend):
             self.engine = AsyncLLMEngine.from_engine_args(self.engine_args)
             self.status = BackendStatus.RUNNING
 
-    async def generate(self, request_data: Dict[str, Any]):
-        async with self.status_lock:
-            if self.status != BackendStatus.RUNNING:
-                return {"error": "Engine is not running"}
-
-        assert self.engine is not None
-
+    def _prepare_generate_request(self, request_data: Dict[str, Any]):
         if request_data is None:
             return {"error": "Request data is missing"}
 
@@ -287,16 +336,31 @@ class VllmBackend(SllmBackend):
             if mct is not None and "max_tokens" not in request_data:
                 request_data["max_tokens"] = mct
 
+        # The OpenAI API flag controls transport, not vLLM sampling.
+        request_data.pop("stream", None)
+
         try:
             sampling_params = SamplingParams(**request_data)
         except Exception as e:
             return {"error": f"Invalid sampling parameters: {e}"}
 
+        return model_name, inputs, request_id, arrival_ts, sampling_params
+
+    async def generate(self, request_data: Dict[str, Any]):
+        async with self.status_lock:
+            if self.status != BackendStatus.RUNNING:
+                return {"error": "Engine is not running"}
+
+        assert self.engine is not None
+
+        prepared = self._prepare_generate_request(request_data)
+        if isinstance(prepared, dict):
+            return prepared
+        model_name, inputs, request_id, arrival_ts, sampling_params = prepared
+
         results_generator = self.engine.generate(
             inputs, sampling_params, request_id
         )
-
-        # TODO stream results
 
         # Non-stream case
         final_output = None
@@ -322,6 +386,84 @@ class VllmBackend(SllmBackend):
                 arrival_ts, first_token_ts, end_ts, final_output
             )
         return api_response
+
+    async def generate_stream(self, request_data: Dict[str, Any]):
+        async with self.status_lock:
+            if self.status != BackendStatus.RUNNING:
+                yield {"error": "Engine is not running"}
+                return
+
+        assert self.engine is not None
+
+        prepared = self._prepare_generate_request(request_data)
+        if isinstance(prepared, dict):
+            yield prepared
+            return
+        model_name, inputs, request_id, arrival_ts, sampling_params = prepared
+
+        results_generator = self.engine.generate(
+            inputs, sampling_params, request_id
+        )
+
+        final_output = None
+        first_token_ts: float | None = None
+        previous_texts: List[str] = []
+        include_roles: List[bool] = []
+
+        try:
+            async for response_output in results_generator:
+                if (
+                    first_token_ts is None
+                    and _count_completion_tokens(response_output) > 0
+                ):
+                    first_token_ts = time.perf_counter()
+
+                final_output = response_output
+                await self.request_trace.update_status(
+                    request_id, response_output
+                )
+
+                if (
+                    response_output.outputs
+                    and str(response_output.outputs[0].finish_reason)
+                    == "migrated"
+                ):
+                    yield {
+                        "error": "Streaming not supported for migrated requests"
+                    }
+                    return
+
+                chunk, previous_texts, include_roles = process_stream_chunk(
+                    response_output,
+                    model_name,
+                    previous_texts,
+                    include_roles,
+                )
+                if any(
+                    choice["delta"] or choice["finish_reason"] is not None
+                    for choice in chunk["choices"]
+                ):
+                    yield chunk
+
+            if final_output is not None:
+                end_ts = time.perf_counter()
+                if arrival_ts is not None:
+                    metrics = _build_sllm_metrics(
+                        arrival_ts, first_token_ts, end_ts, final_output
+                    )
+                    logger.info(
+                        "stream request model=%s ttft=%.3fs tpot=%.3fs e2e=%.3fs "
+                        "prompt_tokens=%s completion_tokens=%s",
+                        model_name,
+                        metrics.get("ttft_s", 0.0),
+                        metrics.get("tpot_s", 0.0),
+                        metrics.get("e2e_s", 0.0),
+                        metrics.get("prompt_tokens"),
+                        metrics.get("completion_tokens"),
+                    )
+        finally:
+            if final_output is not None and not self.trace_debug:
+                await self.request_trace.delete_request(request_id)
 
     async def shutdown(self):
         """Abort all requests and shutdown the backend."""

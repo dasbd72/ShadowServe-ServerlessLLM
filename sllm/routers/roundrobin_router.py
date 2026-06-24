@@ -143,10 +143,16 @@ class RoundRobinRouter(SllmRouter):
         pattern = "{model_name}_{id}"
         return pattern.format(model_name=self.model_name, id=uuid.uuid4())
 
-    async def inference(self, request_data: dict, action: str):
+    async def _finish_inference_request(self):
+        async with self.request_count_lock:
+            self.request_count -= 1
+
+    async def _allocate_inference_instance(
+        self, request_data: dict, action: str
+    ):
         async with self.running_lock:
             if not self.running:
-                return {"error": "Instance stopped"}
+                return None, {"error": "Instance stopped"}
 
         async with self.request_count_lock:
             self.request_count += 1
@@ -163,7 +169,8 @@ class RoundRobinRouter(SllmRouter):
         async with self.instance_management_lock:
             if instance_id not in self.ready_inference_instances:
                 logger.error(f"Instance {instance_id} not found")
-                return {"error": "Instance not found"}
+                await self._finish_inference_request()
+                return None, {"error": "Instance not found"}
             instance = self.ready_inference_instances[instance_id]
 
         # sanity check
@@ -171,29 +178,70 @@ class RoundRobinRouter(SllmRouter):
             lora_adapter_name = request_data["lora_adapter_name"]
             if lora_adapter_name not in self.loaded_lora_adapters:
                 logger.error(f"Lora adapter {lora_adapter_name} not found")
-                return {"error": f"Lora adapter {lora_adapter_name} not found"}
+                await instance.add_requests(-1)
+                await self._finish_inference_request()
+                return (
+                    None,
+                    {"error": f"Lora adapter {lora_adapter_name} not found"},
+                )
             await instance.backend_instance.load_lora_adapter.remote(
                 lora_name=lora_adapter_name,
                 lora_path=self.loaded_lora_adapters[lora_adapter_name],
             )
+
+        return instance, None
+
+    async def inference(self, request_data: dict, action: str):
+        instance, error = await self._allocate_inference_instance(
+            request_data, action
+        )
+        if error is not None:
+            return error
+
+        assert instance is not None
         # NOTE: `.remote(request_data)` does not work, don't know why.
         # Looks like a known issue:
         # https://github.com/ray-project/ray/issues/26283#issuecomment-1780691475
-        if action == "generate":
-            result = await instance.backend_instance.generate.remote(
+        try:
+            if action == "generate":
+                result = await instance.backend_instance.generate.remote(
+                    request_data=request_data
+                )
+            elif action == "encode":
+                result = await instance.backend_instance.encode.remote(
+                    request_data=request_data
+                )
+            else:
+                result = {"error": "Invalid action"}
+            return result
+        finally:
+            logger.info("Finished processing request")
+            await instance.add_requests(-1)
+            await self._finish_inference_request()
+
+    async def inference_stream(self, request_data: dict, action: str):
+        if action != "generate":
+            yield {"error": "Streaming only supported for generate"}
+            return
+
+        instance, error = await self._allocate_inference_instance(
+            request_data, action
+        )
+        if error is not None:
+            yield error
+            return
+
+        assert instance is not None
+        try:
+            result_generator = instance.backend_instance.generate_stream.remote(
                 request_data=request_data
             )
-        elif action == "encode":
-            result = await instance.backend_instance.encode.remote(
-                request_data=request_data
-            )
-        else:
-            result = {"error": "Invalid action"}
-        logger.info(f"Finished processing request")
-        await instance.add_requests(-1)
-        async with self.request_count_lock:
-            self.request_count -= 1
-        return result
+            async for chunk_ref in result_generator:
+                yield await chunk_ref
+        finally:
+            logger.info("Finished processing streaming request")
+            await instance.add_requests(-1)
+            await self._finish_inference_request()
 
     async def fine_tuning(self, request_data: dict):
         logger.info(f"Starting fine-tuning for model {self.model_name}")
